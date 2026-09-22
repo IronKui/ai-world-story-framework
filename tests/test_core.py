@@ -50,7 +50,7 @@ def test_config(tmp: pathlib.Path) -> None:
     path = tmp / "config.json"
     store = ConfigStore(path=path)
 
-    check("阶段2 缺失文件回退默认", store.load().model == "deepseek-chat")
+    check("阶段2 缺失文件回退默认", store.load().model == "deepseek-flash")
 
     config = AppConfig(api_key="sk-test-abcdefghijklmn", debug_log=True, timeout=45)
     store.save(config)
@@ -294,6 +294,150 @@ def test_savegame(tmp: pathlib.Path) -> None:
 
 
 # ----------------------------------------------------------------------
+# 阶段 5：计价与用量
+# ----------------------------------------------------------------------
+
+
+def test_pricing() -> None:
+    from datetime import datetime, timezone
+
+    from core.pricing import (
+        MODEL_PRICING,
+        calculate_cost,
+        cost_from_usage,
+        is_peak_now,
+        resolve_model,
+    )
+
+    # 逐项核对官方价表：100 万 token 的花费应恰好等于标价
+    for model in ("deepseek-flash", "deepseek-v4-pro"):
+        for tier, peak in (("peak", True), ("off_peak", False)):
+            rates = MODEL_PRICING[model][tier]
+            cost = calculate_cost(
+                model,
+                cache_hit_tokens=1_000_000,
+                cache_miss_tokens=1_000_000,
+                output_tokens=1_000_000,
+                peak=peak,
+            )
+            check(
+                f"阶段5 价表 {model}/{tier}",
+                abs(cost.input_cost - (rates["cache_hit"] + rates["cache_miss"])) < 1e-9
+                and abs(cost.output_cost - rates["output"]) < 1e-9,
+            )
+
+    # 官方明确：低谷价 = 高峰价的一半
+    for model in ("deepseek-flash", "deepseek-v4-pro"):
+        peak_cost = calculate_cost(model, cache_miss_tokens=10**6, output_tokens=10**6, peak=True)
+        off_cost = calculate_cost(model, cache_miss_tokens=10**6, output_tokens=10**6, peak=False)
+        check(
+            f"阶段5 {model} 低谷为高峰之半",
+            abs(peak_cost.total_usd / off_cost.total_usd - 2.0) < 1e-9,
+        )
+
+    # 峰谷时段：UTC 周一至周五 01:00-04:00 与 06:00-10:00，左闭右开
+    windows = [
+        ("周一 00:59 低谷", datetime(2026, 9, 21, 0, 59, tzinfo=timezone.utc), False),
+        ("周一 01:00 高峰", datetime(2026, 9, 21, 1, 0, tzinfo=timezone.utc), True),
+        ("周一 03:59 高峰", datetime(2026, 9, 21, 3, 59, tzinfo=timezone.utc), True),
+        ("周一 04:00 低谷", datetime(2026, 9, 21, 4, 0, tzinfo=timezone.utc), False),
+        ("周一 05:59 低谷", datetime(2026, 9, 21, 5, 59, tzinfo=timezone.utc), False),
+        ("周一 06:00 高峰", datetime(2026, 9, 21, 6, 0, tzinfo=timezone.utc), True),
+        ("周一 09:59 高峰", datetime(2026, 9, 21, 9, 59, tzinfo=timezone.utc), True),
+        ("周一 10:00 低谷", datetime(2026, 9, 21, 10, 0, tzinfo=timezone.utc), False),
+        ("周六 02:00 低谷", datetime(2026, 9, 26, 2, 0, tzinfo=timezone.utc), False),
+        ("周日 07:00 低谷", datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc), False),
+    ]
+    for label, moment, expected in windows:
+        check(f"阶段5 峰谷 {label}", is_peak_now(moment) is expected)
+
+    # 别名归一：官方说明旧名仍被接受，按 Flash 计费
+    for alias in ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"):
+        check(f"阶段5 别名 {alias} 归一到 Flash", resolve_model(alias) == "deepseek-flash")
+    check("阶段5 未知模型兜底", resolve_model("不存在的模型") == "deepseek-flash")
+
+    # usage 缺缓存拆分时，全部按未命中计 —— 宁可估高不估低
+    no_cache_split = cost_from_usage(
+        "deepseek-flash", {"prompt_tokens": 1000, "completion_tokens": 500}, peak=False
+    )
+    check(
+        "阶段5 无缓存拆分时按未命中计",
+        no_cache_split.cache_miss_tokens == 1000 and no_cache_split.cache_hit_tokens == 0,
+    )
+
+    # 实测返回的完整 usage 结构
+    real_usage = {
+        "prompt_tokens": 13,
+        "completion_tokens": 51,
+        "total_tokens": 64,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 13,
+    }
+    cost = cost_from_usage("deepseek-flash", real_usage, peak=False)
+    expected = (13 * 0.15 + 51 * 0.60) / 1_000_000
+    check("阶段5 实测 usage 计价", abs(cost.total_usd - expected) < 1e-12)
+
+
+def test_usage(tmp: pathlib.Path) -> None:
+    from core.usage import UsageTotals, UsageTracker
+
+    tracker = UsageTracker(path=tmp / "usage.json")
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 200,
+        "prompt_cache_hit_tokens": 40,
+        "prompt_cache_miss_tokens": 60,
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+
+    record = tracker.record(
+        model="deepseek-flash", usage=usage, reason="剧情", peak=False
+    )
+    check("阶段5 记录 token 拆分",
+          record.prompt_tokens == 100 and record.completion_tokens == 200)
+    check("阶段5 记录花费为正", record.cost_usd > 0)
+    check("阶段5 session 与 lifetime 同步",
+          tracker.session.calls == 1 and tracker.lifetime.calls == 1)
+    check("阶段5 按模型归集", "deepseek-flash" in tracker.by_model)
+
+    # 别名应该归到同一个模型桶里，而不是各算各的
+    tracker.record(model="deepseek-chat", usage=usage, reason="剧情", peak=False)
+    check(
+        "阶段5 别名归入同一模型桶",
+        list(tracker.by_model.keys()) == ["deepseek-flash"]
+        and tracker.by_model["deepseek-flash"].calls == 2,
+    )
+
+    # 持久化往返
+    reloaded = UsageTracker(path=tmp / "usage.json")
+    reloaded.load()
+    check("阶段5 累计持久化往返", reloaded.lifetime.calls == 2
+          and abs(reloaded.lifetime.cost_usd - tracker.lifetime.cost_usd) < 1e-12)
+    check("阶段5 最近记录持久化", len(reloaded.recent) == 2)
+
+    # 重置只清历史累计，本次运行的统计要保留。
+    # 这里必须用 tracker（session 里有 2 次）来断言，
+    # reloaded 是从磁盘加载的，它的 session 本来就是空的。
+    tracker.reset_lifetime()
+    check("阶段5 重置只清历史", tracker.lifetime.calls == 0
+          and tracker.session.calls == 2)
+
+    # 统计文件不含正文内容
+    raw = (tmp / "usage.json").read_text(encoding="utf-8")
+    check("阶段5 统计文件不含 prompt 原文",
+          "content" not in raw and "message" not in raw)
+
+    # 损坏文件不该让程序起不来
+    (tmp / "usage.json").write_text("{ 坏", encoding="utf-8")
+    broken = UsageTracker(path=tmp / "usage.json")
+    broken.load()
+    check("阶段5 损坏统计文件不抛异常", broken.lifetime.calls == 0)
+
+    check("阶段5 UsageTotals 类型兜底",
+          UsageTotals.from_dict({"calls": "abc", "cost_usd": None}).calls == 0)
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -319,6 +463,8 @@ def main() -> int:
         test_config(tmp)
         test_world(tmp)
         test_savegame(tmp)
+        test_pricing()
+        test_usage(tmp)
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

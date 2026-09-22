@@ -14,9 +14,15 @@ import time
 import urllib.error
 import urllib.request
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from core.config import DEFAULT_BASE_URL, DEFAULT_MODEL
+from core.config import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    THINKING_DISABLED,
+    THINKING_ENABLED,
+)
 
 # Python 3.14 读取 Windows 证书存储时会对个别第三方根证书报这个警告。
 # 默认校验路径本身是好的（握手能成功），这里只是压掉噪音。
@@ -27,6 +33,17 @@ warnings.filterwarnings(
 #: 探测连通性用的最小请求，不消耗任何 token
 MODELS_PATH = "/models"
 CHAT_PATH = "/chat/completions"
+
+#: SSE 流结束标记
+SSE_DONE = "[DONE]"
+
+#: 模型返回的 finish_reason 含义
+FINISH_REASONS = {
+    "stop": "正常结束",
+    "length": "达到 max_tokens 上限，输出被截断",
+    "content_filter": "内容被安全策略过滤",
+    "insufficient_system_resource": "服务端资源不足，输出中断",
+}
 
 
 class ApiError(Exception):
@@ -51,6 +68,26 @@ class ApiError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+@dataclass
+class ChatResult:
+    """一次对话调用的结果。"""
+
+    content: str = ""
+    usage: dict = field(default_factory=dict)
+    model: str = ""
+    finish_reason: str = ""
+    #: 本次调用耗时（毫秒）
+    latency_ms: int = 0
+    #: max_tokens 截断了输出，调用方通常应当据此重试或提高上限
+    truncated: bool = False
+    #: 被取消时置位，此时 content 只有半截
+    cancelled: bool = False
+
+    @property
+    def finish_note(self) -> str:
+        return FINISH_REASONS.get(self.finish_reason, self.finish_reason or "未知")
 
 
 @dataclass
@@ -153,6 +190,26 @@ def _classify_network_error(exc: Exception, url: str = "") -> ApiError:
     return ApiError(
         f"网络请求失败：{exc}", kind="network", detail=repr(exc)
     )
+
+
+def _resolve_thinking(value: str | bool | None) -> bool | None:
+    """把 thinking 参数归一成 True / False / None。
+
+    None 表示「不显式指定」，交给服务端默认行为 ——
+    实测 deepseek-flash 默认是开启思考模式，所以调用方通常
+    应该显式传 False，除非确实需要模型多想一想。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+
+    text = str(value).strip().lower()
+    if text in (THINKING_ENABLED, "true", "on", "1", "yes"):
+        return True
+    if text in (THINKING_DISABLED, "false", "off", "0", "no"):
+        return False
+    return None
 
 
 def _host_of(url: str) -> str:
@@ -266,6 +323,169 @@ class DeepSeekClient:
         return parsed if isinstance(parsed, dict) else {"data": parsed}
 
     # ------------------------------------------------------------------
+    # 对话（流式）
+    # ------------------------------------------------------------------
+
+    def build_chat_payload(
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool = False,
+        thinking: str | bool | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> dict:
+        """组装请求体。
+
+        thinking 传 False 会在请求里带 thinking.type=disabled。
+        实测同一句提示词，开启时输出 17 token、关闭后只需 1 token，
+        所以默认关闭；具体见 AppConfig.thinking_mode。
+        """
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            # 不加这个，流式响应里不会带 usage，就没法统计花费
+            "stream_options": {"include_usage": True},
+        }
+
+        enabled = _resolve_thinking(thinking)
+        if enabled is not None:
+            payload["thinking"] = {"type": THINKING_ENABLED if enabled else THINKING_DISABLED}
+
+        if json_mode:
+            # DeepSeek 的 JSON 模式要求 prompt 里出现 "json" 字样，
+            # 否则直接报错；调用方拼 prompt 时要带上
+            payload["response_format"] = {"type": "json_object"}
+
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+
+        return payload
+
+    def stream_chat(
+        self,
+        messages: list[dict],
+        *,
+        on_delta: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        json_mode: bool = False,
+        thinking: str | bool | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> ChatResult:
+        """流式对话。
+
+        on_delta 每收到一个片段就被调用一次（在**调用方线程**里），
+        界面层通过它做逐字显示。
+
+        should_stop 返回 True 时提前中断，不会抛异常，
+        返回的 ChatResult.cancelled 为 True。
+
+        中途断流不会丢弃已收到的内容 —— 半截剧情也好过一片空白，
+        调用方可以按 content 是否为空自行决定要不要重试。
+        """
+        if not self.api_key:
+            raise ApiError(
+                "尚未配置 API Key。\n\n请先在「设置 → API 设置」中填入你的 DeepSeek API Key。",
+                kind="auth",
+            )
+
+        payload = self.build_chat_payload(
+            messages,
+            json_mode=json_mode,
+            thinking=thinking,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        url = f"{self.base_url}{CHAT_PATH}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "User-Agent": "ai-world-story-framework/0.1",
+            },
+            method="POST",
+        )
+
+        started = time.perf_counter()
+        pieces: list[str] = []
+        usage: dict = {}
+        finish_reason = ""
+        cancelled = False
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                for raw_line in response:
+                    if should_stop is not None and should_stop():
+                        cancelled = True
+                        break
+
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or not line.startswith("data:"):
+                        # SSE 里还有 event: / id: / 空行等，一律忽略
+                        continue
+
+                    body = line[5:].strip()
+                    if body == SSE_DONE:
+                        break
+
+                    try:
+                        event = json.loads(body)
+                    except json.JSONDecodeError:
+                        # 个别分片可能被截断，跳过而不是让整次生成失败
+                        continue
+
+                    chunk_usage = event.get("usage")
+                    if isinstance(chunk_usage, dict) and chunk_usage:
+                        # 实测 usage 出现在最后一个分片，且该分片 choices 为空
+                        usage = chunk_usage
+
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        piece = delta.get("content")
+                        if piece:
+                            pieces.append(piece)
+                            if on_delta is not None:
+                                on_delta(piece)
+
+                        if choice.get("finish_reason"):
+                            finish_reason = str(choice["finish_reason"])
+
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                pass
+            raise _classify_http_error(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise _classify_network_error(exc, url) from exc
+        except (socket.timeout, TimeoutError) as exc:
+            raise _classify_network_error(exc, url) from exc
+        except OSError as exc:
+            raise _classify_network_error(exc, url) from exc
+
+        latency = int((time.perf_counter() - started) * 1000)
+        content = "".join(pieces)
+
+        return ChatResult(
+            content=content,
+            usage=usage,
+            model=self.model,
+            finish_reason=finish_reason,
+            latency_ms=latency,
+            truncated=finish_reason == "length",
+            cancelled=cancelled,
+        )
+
+    # ------------------------------------------------------------------
     # 连通性测试
     # ------------------------------------------------------------------
 
@@ -326,6 +546,9 @@ class DeepSeekClient:
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 8,
             "temperature": 0,
+            # 关掉思考模式：这一步只是为了验证模型可调用，
+            # 开着的话推理 token 会把费用抬高十几倍
+            "thinking": {"type": THINKING_DISABLED},
         }
 
         try:

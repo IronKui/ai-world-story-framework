@@ -26,6 +26,7 @@ from core.savegame import (
     SaveFormatError,
     SaveStore,
 )
+from core.usage import UsageTracker
 from core.world import DEFAULT_CONTEXT_BUDGET, WorldDocument, WorldStore
 from ui import styles
 from ui.action_panel import ActionPanel
@@ -33,6 +34,7 @@ from ui.inventory_panel import InventoryPanel
 from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
+from ui.usage_dialog import UsageDialog
 from ui.world_doc_dialog import WorldDocDialog
 from ui.world_panel import WorldPanel
 
@@ -50,6 +52,8 @@ class MainWindow(QMainWindow):
         self._config: AppConfig = self._config_store.load()
         self._world_store = WorldStore()
         self._save_store = SaveStore()
+        self._usage = UsageTracker()
+        self._usage.load()
         #: 当前生效的世界观文档，导入或读档后填充
         self._world: WorldDocument | None = None
         #: 玩家信息与历史摘要，构成存档的核心内容
@@ -63,6 +67,7 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._connect_signals()
         self._refresh_status()
+        self._refresh_usage_label()
 
         # 演示数据：接入 AI 后由 core 层填充
         self._load_demo_content()
@@ -125,6 +130,11 @@ class MainWindow(QMainWindow):
         self.act_debug_log.setToolTip("记录每一次发给 AI 的 prompt 与返回结果")
         self.act_debug_log.toggled.connect(self._on_debug_log_toggled)
         settings_menu.addAction(self.act_debug_log)
+
+        self.act_usage = QAction("用量与花费…", self)
+        self.act_usage.setStatusTip("查看 token 消耗与估算花费")
+        self.act_usage.triggered.connect(self._on_usage)
+        settings_menu.addAction(self.act_usage)
 
         # ---------- 帮助 ----------
         help_menu = bar.addMenu("帮助")
@@ -202,9 +212,10 @@ class MainWindow(QMainWindow):
 
         self.status_world = QLabel("世界观：未导入")
         self.status_api = QLabel("API：未配置")
+        self.status_usage = QLabel("本次花费：—")
         self.status_mode = QLabel("就绪")
 
-        for label in (self.status_world, self.status_api):
+        for label in (self.status_world, self.status_api, self.status_usage):
             label.setStyleSheet(
                 f"color:{styles.COLORS['text_faint']}; font-size:12px;"
             )
@@ -212,6 +223,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.status_world)
         bar.addWidget(self._separator_label())
         bar.addWidget(self.status_api)
+        bar.addPermanentWidget(self.status_usage)
+        bar.addPermanentWidget(self._separator_label())
         bar.addPermanentWidget(self.status_mode)
 
     @staticmethod
@@ -291,8 +304,14 @@ class MainWindow(QMainWindow):
     # ---- 设置 ----
 
     def _on_api_settings(self) -> None:
-        dialog = ApiSettingsDialog(self._config, self)
-        if dialog.exec() != ApiSettingsDialog.DialogCode.Accepted:
+        dialog = ApiSettingsDialog(self._config, tracker=self._usage, parent=self)
+        accepted = dialog.exec() == ApiSettingsDialog.DialogCode.Accepted
+
+        # 完整测试可能产生过调用，无论保存与否都要刷新花费显示
+        if dialog.usage_recorded is not None:
+            self._refresh_usage_label()
+
+        if not accepted:
             return
 
         config = dialog.current_config()
@@ -523,6 +542,38 @@ class MainWindow(QMainWindow):
             options.append("开始正式游玩（阶段 9）")
 
         self.action_panel.set_options(options)
+
+    def _on_usage(self) -> None:
+        dialog = UsageDialog(self._usage, self._config.usd_to_cny, self)
+        dialog.exec()
+        self._refresh_usage_label()
+
+    def _refresh_usage_label(self) -> None:
+        """状态栏的本次运行花费。只统计本次运行，避免历史数字干扰判断。"""
+        session = self._usage.session
+        usd_to_cny = self._config.usd_to_cny
+
+        if session.calls == 0:
+            self.status_usage.setText("本次花费：—")
+            self.status_usage.setStyleSheet(
+                f"color:{styles.COLORS['text_faint']}; font-size:12px;"
+            )
+            self.status_usage.setToolTip("尚未调用过 AI")
+            return
+
+        self.status_usage.setText(
+            f"本次花费：¥{session.cny(usd_to_cny):.4f}"
+        )
+        self.status_usage.setStyleSheet(
+            f"color:{styles.COLORS['text_dim']}; font-size:12px;"
+        )
+        self.status_usage.setToolTip(
+            f"本次运行 {session.calls} 次调用，"
+            f"{session.total_tokens:,} token\n"
+            f"估算 ${session.cost_usd:.6f}（汇率 1$ = ¥{usd_to_cny:.2f}）\n"
+            f"历史累计 {self._usage.lifetime.calls} 次，"
+            f"${self._usage.lifetime.cost_usd:.6f}"
+        )
 
     def _refresh_status(self) -> None:
         """刷新状态栏的「世界观 / API」两段状态。"""

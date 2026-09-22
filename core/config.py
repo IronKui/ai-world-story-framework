@@ -14,10 +14,23 @@ from core.paths import CONFIG_FILE, ensure_dirs
 from core.storage import read_json, write_json_atomic
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_MODEL = "deepseek-flash"
 
 #: 界面上可选的模型（允许用户手填其它模型名）
-KNOWN_MODELS = ["deepseek-chat", "deepseek-reasoner"]
+#: 旧名 deepseek-chat / deepseek-reasoner 官方仍接受但模型已下线，
+#: 请求会被路由到 V4.1-Flash 并按 Flash 计费，所以不再作为默认
+KNOWN_MODELS = ["deepseek-flash", "deepseek-v4-pro"]
+
+#: 思考模式。默认关闭 —— 实测同一句「只回复两个字」，
+#: 开启时输出 17 token，关闭后只需 1 token，而生成的剧情文本
+#: 质量没有肉眼可见差别，推理 token 按输出价计费，纯属浪费
+THINKING_DISABLED = "disabled"
+THINKING_ENABLED = "enabled"
+
+#: 计价模式：auto 按当前时刻自动判断峰谷，也可强制按某一档估算
+PRICING_AUTO = "auto"
+PRICING_PEAK = "peak"
+PRICING_OFF_PEAK = "off_peak"
 
 
 @dataclass
@@ -29,6 +42,12 @@ class AppConfig:
     debug_log: bool = False
     #: 世界观一致性校验的最大重试次数，需求锁定为 3
     max_validate_retries: int = 3
+    #: 思考模式，disabled / enabled
+    thinking_mode: str = THINKING_DISABLED
+    #: 计价模式，auto / peak / off_peak
+    pricing_mode: str = PRICING_AUTO
+    #: 人民币展示汇率（估算值，请自行按实际汇率调整）
+    usd_to_cny: float = 7.1
 
     # ---------- 序列化 ----------
 
@@ -45,6 +64,11 @@ class AppConfig:
             value = data[key]
             if isinstance(default, bool):
                 setattr(cfg, key, bool(value))
+            elif isinstance(default, float):
+                try:
+                    setattr(cfg, key, float(value))
+                except (TypeError, ValueError):
+                    pass
             elif isinstance(default, int):
                 try:
                     setattr(cfg, key, int(value))
@@ -72,6 +96,18 @@ class AppConfig:
     def normalized_base_url(self) -> str:
         url = self.base_url.strip() or DEFAULT_BASE_URL
         return url.rstrip("/")
+
+    @property
+    def thinking_enabled(self) -> bool:
+        return self.thinking_mode == THINKING_ENABLED
+
+    def forced_peak(self) -> bool | None:
+        """把 pricing_mode 翻译成 calculate_cost 需要的 peak 参数。"""
+        if self.pricing_mode == PRICING_PEAK:
+            return True
+        if self.pricing_mode == PRICING_OFF_PEAK:
+            return False
+        return None
 
 
 @dataclass

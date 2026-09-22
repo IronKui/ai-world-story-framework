@@ -175,19 +175,23 @@ QPushButton#DangerButton { color: $danger; border-color: #4a2a32; }
 QPushButton#DangerButton:hover { background: #2a1c22; border-color: $danger; }
 
 /* ---------- 输入控件 ---------- */
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {
+/* 注意：QDoubleSpinBox 不是 QSpinBox 的子类，
+   选择器必须分别写，漏掉哪个哪个就保持系统默认的浅色外观 */
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background: $bg_input;
     border: 1px solid $border;
     border-radius: 7px;
     padding: 8px 12px;
     selection-background-color: $accent_dim;
 }
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus,
+QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: $accent;
 }
-QLineEdit:disabled, QPlainTextEdit:disabled { color: $text_faint; }
+QLineEdit:disabled, QPlainTextEdit:disabled,
+QSpinBox:disabled, QDoubleSpinBox:disabled { color: $text_faint; }
 /* 右侧要给原生上下按钮留位，否则文字（含后缀）会压到箭头上 */
-QSpinBox { padding-right: 22px; }
+QSpinBox, QDoubleSpinBox { padding-right: 22px; }
 
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView {
