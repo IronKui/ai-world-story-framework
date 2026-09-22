@@ -768,7 +768,7 @@ class MainWindow(QMainWindow):
     # ---- 世界观 ----
 
     def _on_world_docs(self) -> None:
-        dialog = WorldDocDialog(self._world, self)
+        dialog = WorldDocDialog(self._world, self._config, self._usage, self)
         dialog.exec()
 
         if dialog.current_deleted:

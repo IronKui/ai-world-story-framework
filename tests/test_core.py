@@ -1482,6 +1482,162 @@ def test_background() -> None:
 
 
 # ----------------------------------------------------------------------
+# 世界观生成 agent
+# ----------------------------------------------------------------------
+
+
+def _fake_world_doc(sections: int = 5, body_repeat: int = 25, title: str = "# 测试世界") -> str:
+    """造一份结构合法的文档，供检查逻辑使用。"""
+    parts = [title]
+    for i in range(sections):
+        parts.append(f"## 第{i + 1}节 设定")
+        parts.append("这是一段用于测试的世界观设定内容。" * body_repeat)
+    return "\n\n".join(parts)
+
+
+def test_worldgen() -> None:
+    from core.worldgen import (
+        MAX_CHARS,
+        MIN_CHARS,
+        MIN_SECTIONS,
+        WorldGenError,
+        build_generate_messages,
+        check_structure,
+        generate_world,
+        revise_world,
+    )
+
+    # ---------- 结构检查 ----------
+    ok, problem = check_structure(_fake_world_doc())
+    check("生成 合格文档通过检查", ok, problem)
+
+    cases = [
+        ("空文档", "", "空"),
+        ("太短", "# 世界\n\n## 甲\n\n短", "太短"),
+        ("超长", _fake_world_doc(9, 260), "太长"),
+        ("缺一级标题", _fake_world_doc().replace("# 测试世界", "测试世界", 1), "一级标题"),
+        ("标题太少", _fake_world_doc(sections=2, body_repeat=120), "分节标题"),
+        ("代码块包裹", "```\n" + _fake_world_doc() + "\n```", "一级标题"),
+    ]
+    for label, text, expect_in in cases:
+        passed, why = check_structure(text)
+        check(
+            f"生成 拒绝 {label}",
+            not passed and expect_in in why,
+            f"passed={passed} why={why[:40]}",
+        )
+
+    # 边界：刚好达标要放过，差一点要拦下
+    just_enough = _fake_world_doc(4, 22)
+    passed, why = check_structure(just_enough)
+    check(
+        "生成 长度边界处理正确",
+        passed == (len(just_enough.strip()) >= MIN_CHARS),
+        f"{len(just_enough.strip())} 字 vs 下限 {MIN_CHARS}",
+    )
+    check("生成 分节下限为 4", MIN_SECTIONS == 4)
+
+    # ---------- 提示词 ----------
+    messages = build_generate_messages("一个全是沙漠的世界")
+    check("生成 提示词含用户描述", "一个全是沙漠的世界" in messages[-1]["content"])
+    check("生成 提示词声明是文件规范", "Markdown" in messages[0]["content"])
+    # 这条最关键：不能把剧情当设定写，否则框架动态生成会与之冲突
+    check(
+        "生成 提示词要求写世界而非故事",
+        "不是**故事**" in messages[0]["content"] and "不要写：主角" in messages[0]["content"],
+    )
+    check(
+        "生成 提示词声明字数区间",
+        str(MIN_CHARS) in messages[0]["content"] and str(MAX_CHARS) in messages[0]["content"],
+    )
+
+    with_feedback = build_generate_messages("x", ["文档太短了"])
+    check("生成 反馈会写进提示词", "文档太短了" in with_feedback[-1]["content"])
+
+    from core.worldgen import build_revise_messages
+
+    revise_messages = build_revise_messages("旧文档内容", "多加点势力")
+    check("生成 修改提示词含原文档", "旧文档内容" in revise_messages[-1]["content"])
+    check("生成 修改提示词含要求", "多加点势力" in revise_messages[-1]["content"])
+
+    # ---------- 生成循环 ----------
+    class _FakeGenClient:
+        """按脚本回应世界观生成请求。"""
+
+        def __init__(self, responses: list):
+            self._responses = list(responses)
+            self.calls = 0
+            #: 每次调用发出的消息，用来验证「重试时把问题回喂了」
+            self.sent: list[str] = []
+
+        def stream_chat(self, messages, **kwargs):
+            from core.api_client import ChatResult
+
+            self.calls += 1
+            self.sent.append(messages[-1]["content"])
+            payload = self._responses.pop(0)
+            if isinstance(payload, BaseException):
+                raise payload
+            text, truncated = payload
+            return ChatResult(
+                content=text, model="fake", usage={"prompt_tokens": 10},
+                finish_reason="length" if truncated else "stop",
+                truncated=truncated,
+            )
+
+    good = _fake_world_doc()
+
+    # 一次成功
+    client = _FakeGenClient([(good, False)])
+    result = generate_world(client, "一个世界")
+    check("生成 一次成功", result.document.char_count == len(good.strip()))
+    check("生成 文档名取自一级标题", result.document.name == "测试世界")
+    check("生成 无重试", result.retries_used == 0)
+
+    # 结构不合格会带原因重试
+    client = _FakeGenClient([("太短了", False), (good, False)])
+    result = generate_world(client, "一个世界")
+    check("生成 结构不合格会重试", result.retries_used == 1 and client.calls == 2)
+    # 不带原因的重试等于重新抽卡，很可能又踩同一个坑
+    check(
+        "生成 重试时把具体问题回喂",
+        "太短" in client.sent[1],
+        client.sent[1][-80:],
+    )
+
+    # 被 max_tokens 截断的必须重来 —— 半截文档比没有更糟
+    client = _FakeGenClient([(good[:600], True), (good, False)])
+    result = generate_world(client, "一个世界")
+    check("生成 截断会触发重试", result.retries_used == 1)
+    check(
+        "生成 截断记录被标记",
+        result.attempts[0].truncated and result.attempts[0].problem != "",
+    )
+
+    # 连续失败抛 WorldGenError，且提示要可操作
+    client = _FakeGenClient([("坏", False)] * 3)
+    try:
+        generate_world(client, "一个世界", attempts=3)
+        check("生成 连续失败抛异常", False)
+    except WorldGenError as exc:
+        check("生成 连续失败抛异常", len(exc.problems) == 3)
+        check("生成 失败提示给建议", "建议" in str(exc) and "描述" in str(exc))
+
+    # 空描述直接拦下，不浪费一次 API 调用
+    client = _FakeGenClient([])
+    try:
+        generate_world(client, "   ")
+        check("生成 空描述被拒", False)
+    except Exception:
+        check("生成 空描述被拒", client.calls == 0)
+
+    # 修改模式
+    client = _FakeGenClient([(good, False)])
+    result = revise_world(client, "旧文档", "多点势力")
+    check("生成 修改模式标记正确", result.revised)
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -1519,6 +1675,7 @@ def main() -> int:
         test_themes()
         test_theme_switching()
         test_background()
+        test_worldgen()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

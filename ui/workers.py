@@ -27,6 +27,7 @@ from core.validator import (
     validate_content,
 )
 from core.world import WorldDocument
+from core.worldgen import WorldGenError, generate_world, revise_world
 
 
 class ApiTestThread(QThread):
@@ -445,6 +446,81 @@ class TurnThread(QThread):
             self.failed.emit(
                 ApiError(
                     f"回合结算时出现未预期的错误：{type(exc).__name__}: {exc}",
+                    kind="unknown",
+                    detail=repr(exc),
+                )
+            )
+            return
+
+        self.done.emit(result)
+
+
+class WorldGenThread(QThread):
+    """世界观生成 / 修改线程。
+
+    用户的大白话描述 → 完整的设定文档。
+    生成过程中把文本流式推给界面，让用户看见它在写什么。
+    """
+
+    progress = pyqtSignal(str)
+    #: 流式片段
+    delta = pyqtSignal(str)
+    #: 完成，携带 WorldGenResult
+    done = pyqtSignal(object)
+    #: 失败，携带 WorldGenError 或 ApiError
+    failed = pyqtSignal(object)
+    #: (model, usage_dict, reason)
+    usage_ready = pyqtSignal(str, object, str)
+
+    def __init__(
+        self,
+        client: DeepSeekClient,
+        *,
+        description: str = "",
+        current_text: str = "",
+        change_request: str = "",
+        attempts: int = 3,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._client = client
+        self._description = description
+        self._current_text = current_text
+        self._change_request = change_request
+        self._attempts = attempts
+
+        self._stop = threading.Event()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # noqa: D102
+        common = dict(
+            attempts=self._attempts,
+            on_progress=self.progress.emit,
+            on_delta=self.delta.emit,
+            on_usage=lambda model, usage, reason: self.usage_ready.emit(
+                model, usage, reason
+            ),
+            should_stop=lambda: self._stop.is_set(),
+        )
+
+        try:
+            if self._current_text and self._change_request:
+                result = revise_world(
+                    self._client, self._current_text, self._change_request, **common
+                )
+            else:
+                result = generate_world(
+                    self._client, self._description, **common
+                )
+        except (WorldGenError, ApiError) as exc:
+            self.failed.emit(exc)
+            return
+        except BaseException as exc:  # noqa: BLE001
+            self.failed.emit(
+                ApiError(
+                    f"生成世界观时出现未预期的错误：{type(exc).__name__}: {exc}",
                     kind="unknown",
                     detail=repr(exc),
                 )

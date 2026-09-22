@@ -42,9 +42,14 @@ class WorldDocDialog(QDialog):
     def __init__(
         self,
         current: WorldDocument | None = None,
+        config=None,
+        tracker=None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
+        #: 生成世界观需要 API Key 与用量统计，没传就不显示生成入口
+        self._config = config
+        self._tracker = tracker
         self.setWindowTitle("世界观文档")
         self.setModal(True)
         self.resize(1040, 680)
@@ -134,8 +139,16 @@ class WorldDocDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
 
-        self.import_button = QPushButton("导入新文档…")
-        self.import_button.setObjectName("PrimaryButton")
+        self.generate_button = QPushButton("用 AI 生成…")
+        self.generate_button.setObjectName("PrimaryButton")
+        self.generate_button.setToolTip(
+            "用一句大白话描述你想玩的世界，AI 会写出一份完整设定"
+        )
+        self.generate_button.clicked.connect(self._on_generate)
+        self.generate_button.setEnabled(self._config is not None)
+        buttons.addWidget(self.generate_button)
+
+        self.import_button = QPushButton("导入文档…")
         self.import_button.clicked.connect(self._on_import)
         buttons.addWidget(self.import_button)
 
@@ -300,6 +313,23 @@ class WorldDocDialog(QDialog):
     # ------------------------------------------------------------------
     # 操作
     # ------------------------------------------------------------------
+
+    def _on_generate(self) -> None:
+        """用大白话生成一份新设定。
+
+        生成窗口自己会把文档存进仓库，这里只需要刷新列表并选中它。
+        """
+        from ui.world_gen_dialog import WorldGenDialog
+
+        dialog = WorldGenDialog(self._config, tracker=self._tracker, parent=self)
+        dialog.exec()
+
+        document = dialog.result_document
+        if document is None:
+            return
+
+        self._reload_list(select=document)
+        self._render_detail(document)
 
     def _on_import(self) -> None:
         patterns = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_SUFFIXES))
