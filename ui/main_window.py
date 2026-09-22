@@ -17,7 +17,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QSplitter,
     QVBoxLayout,
-    QWidget,
 )
 
 from core.api_client import DeepSeekClient
@@ -36,12 +35,15 @@ from core.validator import ValidationExhausted
 from core.world import DEFAULT_CONTEXT_BUDGET, WorldDocument, WorldStore
 from ui import styles
 from ui.action_panel import ActionPanel
+from ui.appearance_dialog import AppearanceDialog
+from ui.backdrop import Backdrop
 from ui.event_dialog import EventDialog
 from ui.inventory_panel import InventoryPanel
 from ui.item_gen_dialog import ItemGenDialog
 from ui.log_dialog import LogDialog
 from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
+from ui import shellutils
 from ui.story_panel import StoryPanel
 from ui.usage_dialog import UsageDialog
 from ui.validate_dialog import ValidateDialog
@@ -80,6 +82,7 @@ class MainWindow(QMainWindow):
         self._build_menubar()
         self._build_body()
         self._build_statusbar()
+        self._apply_background()
         self._connect_signals()
         self._refresh_status()
         self._refresh_usage_label()
@@ -137,6 +140,11 @@ class MainWindow(QMainWindow):
         self.act_api.triggered.connect(self._on_api_settings)
         settings_menu.addAction(self.act_api)
 
+        self.act_appearance = QAction("外观设置…", self)
+        self.act_appearance.setStatusTip("配色方案与自定义背景")
+        self.act_appearance.triggered.connect(self._on_appearance)
+        settings_menu.addAction(self.act_appearance)
+
         settings_menu.addSeparator()
 
         self.act_debug_log = QAction("开启调试日志", self)
@@ -182,6 +190,15 @@ class MainWindow(QMainWindow):
         self.act_log_viewer.triggered.connect(self._on_log_viewer)
         tools_menu.addAction(self.act_log_viewer)
 
+        tools_menu.addSeparator()
+
+        self.act_open_data = QAction("打开数据目录…", self)
+        self.act_open_data.setStatusTip(
+            "打开存放配置、存档、世界观与日志的目录"
+        )
+        self.act_open_data.triggered.connect(self._on_open_data_dir)
+        tools_menu.addAction(self.act_open_data)
+
         # ---------- 帮助 ----------
         help_menu = bar.addMenu("帮助")
 
@@ -206,8 +223,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_body(self) -> None:
-        root = QWidget()
-        root.setObjectName("Root")
+        # 用 Backdrop 而不是普通 QWidget：设了背景图时要自己缩放绘制，
+        # QSS 的 background-image 不会缩放，尺寸对不上会很难看
+        root = Backdrop()
+        self._backdrop = root
 
         layout = QVBoxLayout(root)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -683,6 +702,51 @@ class MainWindow(QMainWindow):
         self._config = config
         self._refresh_status()
 
+    def _on_appearance(self) -> None:
+        dialog = AppearanceDialog(self._config, self)
+        if dialog.exec() != AppearanceDialog.DialogCode.Accepted:
+            return
+
+        try:
+            self._config_store.save(self._config)
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", f"无法写入配置文件：\n{exc}")
+            return
+
+        if not dialog.changed:
+            return
+
+        # 主题在启动时应用，这里只能提示重启
+        answer = QMessageBox.question(
+            self,
+            "外观已保存",
+            "配色与背景的改动需要重启程序后生效。\n\n现在重启吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._restart()
+
+    def _restart(self) -> None:
+        """重启程序。
+
+        用 QProcess 启动一份全新实例再退出自己 —— 比在进程内重建界面可靠，
+        重建界面会漏掉一堆初始化顺序上的坑。
+        """
+        import sys as _sys
+
+        from PyQt6.QtCore import QProcess
+
+        try:
+            QProcess.startDetached(_sys.executable, _sys.argv)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self, "重启失败", f"请手动关闭并重新打开程序。\n\n{exc}"
+            )
+            return
+
+        self.close()
+
     def _on_debug_log_toggled(self, enabled: bool) -> None:
         self._config.debug_log = enabled
         try:
@@ -912,6 +976,23 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self._refresh_usage_label()
 
+    def _on_open_data_dir(self) -> None:
+        """打开数据目录。
+
+        打包成 exe 后数据在 %LOCALAPPDATA% 下，用户自己找不到，
+        必须提供这个入口，否则存档没法备份、世界观没法手动放。
+        """
+        from core.paths import DATA_DIR, ensure_dirs
+
+        ensure_dirs()
+        ok, reason = shellutils.open_folder(DATA_DIR)
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "无法打开目录",
+                f"{DATA_DIR}\n\n{reason}\n\n你可以手动复制上面的路径。",
+            )
+
     def _on_log_viewer(self) -> None:
         dialog = LogDialog(LOG, self)
         dialog.exec()
@@ -955,6 +1036,21 @@ class MainWindow(QMainWindow):
             f"历史累计 {self._usage.lifetime.calls} 次，"
             f"${self._usage.lifetime.cost_usd:.6f}"
         )
+
+    def _apply_background(self) -> None:
+        """把配置里的背景图铺到根容器上。
+
+        图加载失败不报错也不打断启动 —— 只是没有背景图而已，
+        用户自己选的文件损坏了，不该让程序起不来。
+        """
+        path = self._config.background_image.strip()
+        if not path:
+            self._backdrop.set_background(None, styles.COLORS["bg_window"])
+            return
+
+        ok = self._backdrop.set_background(path, styles.COLORS["bg_window"])
+        if not ok:
+            LOG.warn("界面", f"背景图加载失败，已忽略：{path}")
 
     def _refresh_status(self) -> None:
         """刷新状态栏的「世界观 / API」两段状态。"""

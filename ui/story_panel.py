@@ -31,8 +31,20 @@ class StoryPanel(Panel):
         self.view.clear()
 
     def append_narrative(self, text: str) -> None:
-        """追加一段正文叙事（场景描述 / 事件文本）。"""
-        self._append_block(text, css_class="narrative", top_gap=16)
+        """追加一段正文叙事（场景描述 / 事件文本）。
+
+        正文按行拆成独立段落，每段带下边距。
+        如果只把换行转成 <br>，行与行之间就没有额外间距 ——
+        短段落会挤成一坨，读起来和一大段文字没区别。
+        """
+        paragraphs = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if not paragraphs:
+            return
+
+        html = "".join(
+            f'<p class="para">{self._escape(line)}</p>' for line in paragraphs
+        )
+        self._append_block(html, css_class="narrative", top_gap=16, raw=True)
 
     def append_player_action(self, text: str) -> None:
         """追加一行玩家行动，用主色调高亮，和 AI 叙事区分开。"""
@@ -95,7 +107,10 @@ class StoryPanel(Panel):
         self.view.document().setDefaultStyleSheet(
             f"""
             body {{ color: {c['text']}; line-height: 175%; }}
-            .narrative {{ color: {c['text']}; font-size: 15px; line-height: 180%; }}
+            .narrative {{ color: {c['text']}; font-size: 15px; line-height: 178%; }}
+            /* 正文段落：段间留白靠这里，不靠空行 ——
+               空行只会多出一行 178% 的空白，间距不可控且偏大 */
+            .para {{ margin: 0 0 0.75em 0; }}
             .action {{ color: {c['accent']}; font-size: 14px; font-weight: 600; }}
             .system {{ color: {c['text_faint']}; font-size: 12.5px; }}
             .speaker {{ color: {c['warning']}; font-weight: 600; }}

@@ -17,7 +17,9 @@ if str(ROOT) not in sys.path:
 
 from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
+from core.config import ConfigStore  # noqa: E402
 from core.debuglog import LOG  # noqa: E402
+from core.version import APP_NAME, APP_VERSION  # noqa: E402
 from ui import styles  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
 
@@ -79,8 +81,15 @@ def install_excepthook() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("动态世界观文字游戏框架")
-    app.setApplicationDisplayName("动态世界观文字游戏框架")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+
+    # 主题必须在建窗口之前应用：各面板在构造时就会读取颜色值，
+    # 晚一步的话窗口里会混着两套配色
+    config = ConfigStore().load()
+    styles.set_theme(config.theme)
+    styles.set_background(config.background_image)
     app.setStyleSheet(styles.stylesheet())
 
     install_excepthook()

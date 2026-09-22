@@ -1318,6 +1318,170 @@ def test_excepthook_installed() -> None:
 
 
 # ----------------------------------------------------------------------
+# 主题与配色
+# ----------------------------------------------------------------------
+
+
+def _relative_luminance(hex_color: str) -> float:
+    """WCAG 相对亮度。"""
+    value = hex_color.lstrip("#")
+    channels = [int(value[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+
+    def linearize(c: float) -> float:
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (linearize(c) for c in channels)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(fg: str, bg: str) -> float:
+    a, b = _relative_luminance(fg), _relative_luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_themes() -> None:
+    """配色方案必须完整且可读。
+
+    深色界面里颜色差一点点就会变成「看不清」，
+    所以每套主题都要逐项算对比度，不能靠肉眼验收。
+    """
+    from ui import styles, themes
+
+    check("主题数量", len(themes.THEMES) >= 4)
+
+    for key, data in themes.THEMES.items():
+        name = data["name"]
+        colors = data["colors"]
+
+        missing = [k for k in themes.REQUIRED_KEYS if k not in colors]
+        check(f"主题 {name} 调色板完整", not missing, str(missing))
+
+        weird = [
+            k for k, v in colors.items()
+            if not (isinstance(v, str) and v.startswith("#") and len(v) == 7)
+        ]
+        check(f"主题 {name} 颜色格式合法", not weird, str(weird))
+
+        # 正文与阅读区是长时间盯着看的地方，要求最高
+        checks = [
+            ("正文/面板", colors["text"], colors["bg_panel"], 4.5),
+            ("正文/输入区", colors["text"], colors["bg_input"], 4.5),
+            ("正文/浮起层", colors["text"], colors["bg_elev"], 4.5),
+            ("次要文字/面板", colors["text_dim"], colors["bg_panel"], 3.0),
+            ("弱化文字/面板", colors["text_faint"], colors["bg_panel"], 2.2),
+            ("主色/面板", colors["accent"], colors["bg_panel"], 4.0),
+            ("警示/面板", colors["danger"], colors["bg_panel"], 3.5),
+        ]
+        # 稀有度标签画在浮起层上
+        for rarity, color_key in themes.RARITY_KEYS.items():
+            checks.append(
+                (f"稀有度{rarity}", colors[color_key], colors["bg_elev"], 4.0)
+            )
+
+        for label, fg, bg, need in checks:
+            got = _contrast(fg, bg)
+            check(
+                f"主题 {name} 对比度 {label}",
+                got >= need,
+                f"{got:.2f} < {need}",
+            )
+
+
+def test_theme_switching() -> None:
+    from ui import styles, themes
+
+    original = styles.current_theme()
+
+    # 关键：切换主题必须**原地修改** COLORS。
+    # 全项目有 80 多处直接读 COLORS[...]，如果重新赋值，
+    # 那些已经持有引用的地方会一直用旧颜色。
+    reference = styles.COLORS
+    styles.set_theme("amber")
+    check("切换主题原地更新 COLORS", styles.COLORS is reference)
+    check("切换后颜色已变", styles.COLORS["accent"] == themes.AMBER["colors"]["accent"])
+    check("切换后主题名正确", styles.current_theme() == "amber")
+
+    # 未知主题名要回退，不能崩
+    styles.set_theme("不存在的主题")
+    check("未知主题回退到默认", styles.current_theme() == themes.DEFAULT_THEME)
+
+    # 稀有度颜色跟着主题走
+    styles.set_theme("jade")
+    check(
+        "稀有度颜色跟随主题",
+        styles.rarity_color("传说") == themes.JADE["colors"]["r_legend"],
+    )
+    check("未知稀有度有兜底", styles.rarity_color("不存在的档位") == styles.COLORS["r_common"])
+
+    styles.set_theme(original)
+
+
+def test_background() -> None:
+    from ui import styles
+
+    original_bg = styles.background_image()
+
+    # 不存在的图要当成没设，不能记下一个坏路径反复报错
+    styles.set_background("C:/根本不存在的图片.png")
+    check("不存在的背景图被忽略", not styles.has_background())
+    check("背景路径被清空", styles.background_image() == "")
+
+    styles.set_background("")
+    check("传空可以清除背景", not styles.has_background())
+
+    # 有背景图时必须输出 rgba，否则面板会把图盖死
+    import tempfile
+
+    styles.set_background(None)
+    plain = styles.stylesheet()
+    check("无背景图时窗口底色不透明", "QWidget#Root { background: #" in plain)
+    check("无背景图时不出现 rgba", "rgba(" not in plain)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+        # 写一个最小的合法 PNG 头就够了 —— styles 只检查文件是否存在
+        handle.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        temp_path = handle.name
+
+    try:
+        styles.set_background(temp_path)
+        check("背景图路径已记录", styles.has_background())
+
+        with_bg = styles.stylesheet()
+        check("有背景图时根容器透空", "QWidget#Root { background: transparent; }" in with_bg)
+        check("有背景图时面板转为 rgba", with_bg.count("rgba(") >= 4)
+    finally:
+        import os
+
+        styles.set_background(None)
+        os.unlink(temp_path)
+
+    # 有背景图时，正文在「最亮背景」下仍要可读。
+    # 这是最坏情况推算：背景图先被压暗，面板再半透明叠上去。
+    from ui import backdrop
+
+    worst_backdrop = 255 * (1 - backdrop.DIM_ALPHA / 255)  # 纯白图片压暗后
+    worst_lum = _relative_luminance(
+        f"#{int(worst_backdrop):02x}{int(worst_backdrop):02x}{int(worst_backdrop):02x}"
+    )
+    for key, alpha in styles._OVERLAY_ALPHA.items():
+        if alpha == 0:
+            continue
+        base = _relative_luminance(styles.COLORS[key])
+        composite = (alpha / 255) * base + (1 - alpha / 255) * worst_lum
+        text_lum = _relative_luminance(styles.COLORS["text"])
+        hi, lo = max(text_lum, composite), min(text_lum, composite)
+        ratio = (hi + 0.05) / (lo + 0.05)
+        check(
+            f"背景图下 {key} 的最坏对比度",
+            ratio >= 4.5,
+            f"{ratio:.2f} < 4.5",
+        )
+
+    styles.set_background(original_bg)
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -1352,6 +1516,9 @@ def main() -> int:
         test_debuglog(tmp)
         test_api_error_logging()
         test_excepthook_installed()
+        test_themes()
+        test_theme_switching()
+        test_background()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

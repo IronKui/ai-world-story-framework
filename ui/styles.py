@@ -5,55 +5,93 @@
 这样 QSS 里大量的花括号可以原样保留。
 """
 
+from pathlib import Path
 from string import Template
+
+from ui import themes
 
 # 中文字体优先级：Windows 用微软雅黑，兜底无衬线
 FONT_FAMILY = '"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif'
 
-COLORS = {
-    # 背景层次，越靠上层越亮
-    "bg_window": "#0f1117",
-    "bg_panel": "#171a23",
-    "bg_elev": "#1e2230",
-    "bg_input": "#12141c",
-    "bg_hover": "#262b3b",
-    # 描边
-    "border": "#2a3044",
-    "border_soft": "#212636",
-    # 文字
-    "text": "#d8dce6",
-    "text_dim": "#8b94a8",
-    "text_faint": "#5d6579",
-    # 主色调
-    "accent": "#6c8cff",
-    "accent_hover": "#839eff",
-    "accent_dim": "#3d4d8f",
-    # 状态色
-    "danger": "#e05c6e",
-    "danger_hover": "#f0707f",
-    "success": "#4fbf8b",
-    "warning": "#d9a441",
-    # 稀有度
-    "r_common": "#9aa3b5",
-    "r_good": "#4fbf8b",
-    "r_rare": "#5aa9f0",
-    "r_epic": "#a97bf0",
-    "r_legend": "#e8a13c",
+#: 当前生效的颜色表。
+#:
+#: 全项目有 80 多处直接读 COLORS[...]，所以切换主题时**必须原地修改**
+#: 这个 dict，不能重新赋值 —— 否则那些已经持有引用的地方会拿到旧颜色。
+COLORS: dict[str, str] = themes.get_colors(themes.DEFAULT_THEME)
+
+#: 当前主题 key
+_current_theme: str = themes.DEFAULT_THEME
+
+#: 自定义背景图路径。空表示不用背景图
+_background_image: str = ""
+
+#: 背景图存在时，各层背景的不透明度（0~255）。
+#:
+#: 数值越高越不透明、文字越清晰，但太高就等于没有背景图了。
+#: 这里能压到 210 左右是有依据的：背景图先被 Backdrop 压暗到最亮
+#: 也只有 77 的亮度（见 backdrop.DIM_ALPHA），此时面板半透明后
+#: 正文对比度仍在 10:1 以上，远高于 4.5:1 的达标线。
+_OVERLAY_ALPHA = {
+    "bg_window": 0,     # 完全透明，由 Backdrop 组件负责画图 + 压暗
+    "bg_panel": 210,    # 面板半透明，背景图透出来
+    "bg_elev": 230,     # 浮起层（卡片）稍实一点，保证内容可读
+    "bg_input": 185,    # 阅读区更透，背景图在这里最明显
 }
 
-# 稀有度 → 颜色，背包/道具展示共用
-RARITY_COLORS = {
-    "普通": COLORS["r_common"],
-    "精良": COLORS["r_good"],
-    "稀有": COLORS["r_rare"],
-    "史诗": COLORS["r_epic"],
-    "传说": COLORS["r_legend"],
-}
+
+def set_theme(key: str) -> None:
+    """切换主题。原地更新 COLORS。"""
+    global _current_theme
+    _current_theme = key if key in themes.THEMES else themes.DEFAULT_THEME
+    COLORS.clear()
+    COLORS.update(themes.get_colors(_current_theme))
+
+
+def set_background(path: str | Path | None) -> None:
+    """设置自定义背景图。传空表示取消。"""
+    global _background_image
+    if not path:
+        _background_image = ""
+        return
+
+    candidate = Path(path)
+    # 图不存在就当没设，避免渲染时反复报错
+    _background_image = str(candidate) if candidate.is_file() else ""
+
+
+def current_theme() -> str:
+    return _current_theme
+
+
+def theme_display_name(key: str | None = None) -> str:
+    data = themes.THEMES.get(key or _current_theme) or themes.THEMES[themes.DEFAULT_THEME]
+    return data["name"]
+
+
+def background_image() -> str:
+    return _background_image
+
+
+def has_background() -> bool:
+    return bool(_background_image)
+
+
+def _with_alpha(hex_color: str, alpha: int) -> str:
+    """把 #rrggbb 转成 QSS 能用的 rgba()。"""
+    value = hex_color.lstrip("#")
+    if len(value) != 6:
+        return hex_color
+    try:
+        r, g, b = (int(value[i : i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return hex_color
+    return f"rgba({r}, {g}, {b}, {alpha})"
 
 
 def rarity_color(rarity: str) -> str:
     """取稀有度对应的颜色，未知稀有度按普通处理。"""
-    return RARITY_COLORS.get(rarity, COLORS["r_common"])
+    key = themes.RARITY_KEYS.get(rarity, "r_common")
+    return COLORS.get(key, COLORS["r_common"])
 
 
 _QSS = Template(
@@ -64,7 +102,7 @@ _QSS = Template(
     color: $text;
 }
 
-QWidget#Root { background: $bg_window; }
+QWidget#Root { background: $bg_root; }
 
 QMainWindow, QDialog { background: $bg_window; }
 
@@ -329,4 +367,14 @@ QCheckBox::indicator:disabled { border-color: $border_soft; }
 
 def stylesheet() -> str:
     """生成最终 QSS 文本。"""
-    return _QSS.substitute(font=FONT_FAMILY, **COLORS)
+    colors = dict(COLORS)
+    # 根容器：没有背景图时就是普通窗口底色；
+    # 有背景图时必须透空，交给 Backdrop 组件去画图
+    colors["bg_root"] = "transparent" if _background_image else colors["bg_window"]
+
+    if _background_image:
+        # 各层底色改成半透明，否则面板会把背景图盖得严严实实
+        for key, alpha in _OVERLAY_ALPHA.items():
+            colors[key] = _with_alpha(colors[key], alpha)
+
+    return _QSS.substitute(font=FONT_FAMILY, **colors)

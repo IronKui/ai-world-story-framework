@@ -48,6 +48,10 @@ class AppConfig:
     pricing_mode: str = PRICING_AUTO
     #: 人民币展示汇率（估算值，请自行按实际汇率调整）
     usd_to_cny: float = 7.1
+    #: 界面配色方案，见 ui/themes.py
+    theme: str = "deep_blue"
+    #: 自定义背景图路径。空表示不用
+    background_image: str = ""
 
     # ---------- 序列化 ----------
 
