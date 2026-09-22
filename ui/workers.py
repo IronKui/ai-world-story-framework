@@ -12,6 +12,16 @@ import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.api_client import ApiError, ChatResult, DeepSeekClient, TestResult
+from core.prompts import JSON_REQUIREMENT, retry_note
+from core.validator import (
+    DEFAULT_MAX_RETRIES,
+    GenerationAttempt,
+    GuardedResult,
+    ValidationExhausted,
+    guarded_generate,
+    validate_content,
+)
+from core.world import WorldDocument
 
 
 class ApiTestThread(QThread):
@@ -138,3 +148,143 @@ class ChatStreamThread(QThread):
 
         self.result = result
         self.done.emit(result)
+
+
+class ValidateThread(QThread):
+    """世界观一致性校验线程（阶段 6）。
+
+    两种模式：
+      · mode="validate"  只校验界面里已给出的文本
+      · mode="generate"  完整走「生成 → 校验 → 冲突则重试」循环
+
+    每次真实的 API 调用都会通过 usage_ready 信号上报用量，
+    由主线程记账 —— 跨线程直接改统计对象不安全。
+    """
+
+    #: 阶段说明文字，例如「第 2/3 次校验中…」
+    progress = pyqtSignal(str)
+    #: 生成阶段的流式文本
+    delta = pyqtSignal(str)
+    #: 一轮尝试结束，携带 GenerationAttempt
+    attempt_done = pyqtSignal(object)
+    #: 全部完成，携带 GuardedResult
+    done = pyqtSignal(object)
+    #: 失败，携带 ValidationExhausted 或 ApiError
+    failed = pyqtSignal(object)
+    #: (usage_dict, model, reason) —— 交给主线程计入用量
+    usage_ready = pyqtSignal(object, str, str)
+
+    def __init__(
+        self,
+        client: DeepSeekClient,
+        world: WorldDocument | None,
+        *,
+        mode: str = "validate",
+        content: str = "",
+        instruction: str = "",
+        kind: str = "内容",
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        context_text: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._client = client
+        self._world = world
+        self._mode = mode
+        self._content = content
+        self._instruction = instruction
+        self._kind = kind
+        self._max_retries = max_retries
+        self._context_text = context_text
+
+        self._stop = threading.Event()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def _should_stop(self) -> bool:
+        return self._stop.is_set()
+
+    # ---------- 执行 ----------
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            if self._mode == "generate":
+                self._run_generate()
+            else:
+                self._run_validate()
+        except ValidationExhausted as exc:
+            self.failed.emit(exc)
+        except ApiError as exc:
+            self.failed.emit(exc)
+        except BaseException as exc:  # noqa: BLE001
+            wrapped = ApiError(
+                f"校验过程中出现未预期的错误：{type(exc).__name__}: {exc}",
+                kind="unknown",
+                detail=repr(exc),
+            )
+            self.failed.emit(wrapped)
+
+    def _run_validate(self) -> None:
+        self.progress.emit("校验中…")
+        verdict, result = validate_content(
+            self._client,
+            self._world,
+            self._content,
+            kind=self._kind,
+            should_stop=self._should_stop,
+        )
+
+        if result is not None and result.usage:
+            self.usage_ready.emit(result.usage, result.model, "世界观校验")
+
+        attempt = GenerationAttempt(index=1, content=self._content, verdict=verdict)
+        self.attempt_done.emit(attempt)
+        self.done.emit(
+            GuardedResult(content=self._content, attempts=[attempt])
+        )
+
+    def _run_generate(self) -> None:
+        def generate(conflict_reasons: list[str]) -> str:
+            messages = [
+                {"role": "system", "content": self._build_system()},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{self._context_text}\n\n"
+                        f"【本次任务】\n{self._instruction}"
+                        f"{retry_note(conflict_reasons)}"
+                    ),
+                },
+            ]
+
+            result = self._client.stream_chat(
+                messages,
+                on_delta=self.delta.emit,
+                should_stop=self._should_stop,
+                max_tokens=1200,
+                temperature=0.9,
+            )
+            if result.usage:
+                self.usage_ready.emit(result.usage, result.model, self._kind)
+            return result.content
+
+        guarded = guarded_generate(
+            self._client,
+            self._world,
+            generate=generate,
+            kind=self._kind,
+            max_retries=self._max_retries,
+            on_progress=self.progress.emit,
+            on_attempt=self.attempt_done.emit,
+            should_stop=self._should_stop,
+        )
+        self.done.emit(guarded)
+
+    def _build_system(self) -> str:
+        return (
+            "你是一个文字游戏的内容生成器。依据给定的世界观设定与当前局势"
+            "生成内容，严格不违背世界观中的硬性规则，但可以合理延伸设定中"
+            "未提及的部分。直接输出内容本身，不要复述设定，不要加解释。\n\n"
+            + JSON_REQUIREMENT.replace("你必须只输出一个 json 对象，", "若任务要求 json 输出，")
+        )

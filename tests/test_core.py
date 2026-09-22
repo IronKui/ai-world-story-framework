@@ -438,6 +438,203 @@ def test_usage(tmp: pathlib.Path) -> None:
 
 
 # ----------------------------------------------------------------------
+# 阶段 6：世界观一致性校验
+# ----------------------------------------------------------------------
+
+
+class _FakeClient:
+    """假的 API 客户端：按预设脚本回应校验请求。
+
+    只有 json_mode=True 的调用（也就是校验）会被应答，
+    其余一律视为测试写错，直接抛错。
+    """
+
+    def __init__(self, verdict_responses: list):
+        self._responses = list(verdict_responses)
+        self.validate_prompts: list[str] = []
+
+    def stream_chat(self, messages, **kwargs):
+        from core.api_client import ChatResult
+
+        if not kwargs.get("json_mode"):
+            raise AssertionError("guarded_generate 只应调用校验接口，不应自己生成")
+        self.validate_prompts.append(messages[-1]["content"])
+        payload = self._responses.pop(0)
+        if isinstance(payload, BaseException):
+            raise payload
+        return ChatResult(content=payload, model="fake", usage={})
+
+
+def test_validator() -> None:
+    import json
+
+    from core.api_client import ApiError
+    from core.prompts import retry_note
+    from core.validator import (
+        ValidationExhausted,
+        guarded_generate,
+        parse_verdict,
+    )
+    from core.world import WorldDocument
+
+    # ---------- 结论解析 ----------
+    ok = parse_verdict('{"conflict": false, "reason": "", "conflicts": []}')
+    check("阶段6 解析 无冲突", ok.passed and ok.reliable and not ok.conflicts)
+
+    bad = parse_verdict(
+        '{"conflict": true, "reason": "灰晶遇水", "conflicts": ["设定说遇水失效，内容却用来储水"]}'
+    )
+    check(
+        "阶段6 解析 有冲突",
+        not bad.passed and bad.reason == "灰晶遇水" and len(bad.conflicts) == 1,
+    )
+
+    # 即使开了 json 模式，模型偶尔仍会包 ```json
+    wrapped = parse_verdict('```json\n{"conflict": false}\n```')
+    check("阶段6 解析 剥掉代码块", wrapped.passed and wrapped.reliable)
+
+    # 前后有解释文字时，截取第一个 { 到最后一个 }
+    noisy = parse_verdict('好的，我的判断是：{"conflict": false} 以上。')
+    check("阶段6 解析 忽略前后噪音", noisy.passed and noisy.reliable)
+
+    # 模型把布尔写成字符串
+    strbool = parse_verdict('{"conflict": "true", "reason": "x"}')
+    check("阶段6 解析 字符串布尔", not strbool.passed)
+
+    # 解析不出来时必须标记为「不可信」，而不是当成通过
+    for label, payload in [
+        ("空返回", ""),
+        ("非 json", "我觉得没问题"),
+        ("缺字段", '{"reason": "没有 conflict 字段"}'),
+    ]:
+        verdict = parse_verdict(payload)
+        check(
+            f"阶段6 解析失败标记不可信 {label}",
+            verdict.error != "" and not verdict.reliable,
+        )
+
+    # ---------- 重试循环 ----------
+    world = WorldDocument(name="灰烬纪元", text="灰晶遇水会失效。")
+
+    def make_generate(contents: list[str], seen: list[list[str]]):
+        def generate(reasons: list[str]) -> str:
+            seen.append(list(reasons))
+            return contents[min(len(seen) - 1, len(contents) - 1)]
+
+        return generate
+
+    # 一次通过
+    client = _FakeClient(['{"conflict": false}'])
+    seen: list[list[str]] = []
+    result = guarded_generate(
+        client, world, generate=make_generate(["内容A"], seen), max_retries=3
+    )
+    check("阶段6 一次通过", result.content == "内容A" and len(result.attempts) == 1)
+    check("阶段6 一次通过时无重试", not result.had_conflicts and result.retries_used == 0)
+    check("阶段6 首次生成不带冲突反馈", seen == [[]])
+
+    # 校验提示词里必须带上世界观原文
+    check("阶段6 校验请求含世界观", "灰晶遇水会失效" in client.validate_prompts[0])
+
+    # 冲突两次后通过，且冲突原因要回喂给下一轮生成
+    client = _FakeClient([
+        '{"conflict": true, "reason": "矛盾A", "conflicts": ["冲突点A"]}',
+        '{"conflict": true, "reason": "矛盾B", "conflicts": ["冲突点B"]}',
+        '{"conflict": false}',
+    ])
+    seen = []
+    result = guarded_generate(
+        client, world, generate=make_generate(["内容A", "内容B", "内容C"], seen),
+        max_retries=3,
+    )
+    check("阶段6 重试后通过", result.content == "内容C" and result.retries_used == 2)
+    check(
+        "阶段6 冲突原因被回喂给生成",
+        seen[0] == [] and seen[1] == ["冲突点A"] and seen[2] == ["冲突点B"],
+    )
+
+    # 连续 3 次失败要抛 ValidationExhausted，且信息可读
+    client = _FakeClient(['{"conflict": true, "reason": "一直冲突", "conflicts": ["点X"]}'] * 3)
+    seen = []
+    try:
+        guarded_generate(
+            client, world, generate=make_generate(["A", "B", "C"], seen), max_retries=3
+        )
+        check("阶段6 连续失败抛异常", False)
+    except ValidationExhausted as exc:
+        check("阶段6 连续失败抛异常", True)
+        check("阶段6 异常含重试次数", exc.max_retries == 3 and len(exc.attempts) == 3)
+        check("阶段6 异常含冲突点", "点X" in str(exc))
+        check("阶段6 异常文案可直接给玩家", "世界观" in str(exc))
+
+    # 重试上限可配：设成 1 就只试一次
+    client = _FakeClient(['{"conflict": true, "reason": "x"}'])
+    try:
+        guarded_generate(
+            client, world, generate=make_generate(["A"], []), max_retries=1
+        )
+        check("阶段6 重试上限可配", False)
+    except ValidationExhausted as exc:
+        check("阶段6 重试上限可配", len(exc.attempts) == 1)
+
+    # 生成空内容也算一次失败，继续重试
+    client = _FakeClient(['{"conflict": false}'])
+    seen = []
+    result = guarded_generate(
+        client, world, generate=make_generate(["", "有内容了"], seen), max_retries=2
+    )
+    check("阶段6 空内容触发重试", result.content == "有内容了" and len(result.attempts) == 2)
+
+    # ---------- 校验器自身出问题 → 放行 ----------
+    # 关键设计：重试循环是用来处理「内容有问题」的，
+    # 不是用来处理「校验器坏了」的。校验不可用不该让玩家卡死。
+    client = _FakeClient(["这不是 json"])
+    seen = []
+    result = guarded_generate(
+        client, world, generate=make_generate(["内容A"], seen), max_retries=3
+    )
+    check(
+        "阶段6 校验结论无法解析时放行",
+        result.content == "内容A"
+        and len(result.attempts) == 1
+        and not result.final_verdict.reliable,
+    )
+
+    failing = _FakeClient([ApiError("网络炸了", kind="network")])
+    seen = []
+    result = guarded_generate(
+        failing, world, generate=make_generate(["内容B"], seen), max_retries=3
+    )
+    check(
+        "阶段6 校验调用失败时放行",
+        result.content == "内容B" and len(result.attempts) == 1,
+    )
+
+    # ---------- 提示词约束 ----------
+    # 这条是整个模块能不能用的前提：如果把「世界观没提到」也判成冲突，
+    # AI 就只能复述设定，动态生成直接废掉。断言提示词里写明了这条。
+    from core.validator import VALIDATE_SYSTEM
+
+    check(
+        "阶段6 提示词区分「未提及」与「冲突」",
+        "不算冲突" in VALIDATE_SYSTEM and "没有提到" in VALIDATE_SYSTEM,
+    )
+    check("阶段6 提示词要求 json", "json" in VALIDATE_SYSTEM.lower())
+
+    note = retry_note(["冲突点A", "冲突点B"])
+    check("阶段6 重试说明含全部冲突点", "冲突点A" in note and "冲突点B" in note)
+    check("阶段6 无冲突时重试说明为空", retry_note([]) == "")
+
+    # 没有世界观时不该报错，且提示词要说明「可自由发挥」
+    worldless = _FakeClient(['{"conflict": false}'])
+    result = guarded_generate(
+        worldless, None, generate=make_generate(["内容"], []), max_retries=1
+    )
+    check("阶段6 无世界观时可正常生成", result.content == "内容")
+    check("阶段6 无世界观提示词有说明", "尚未导入" in worldless.validate_prompts[0])
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -465,6 +662,7 @@ def main() -> int:
         test_savegame(tmp)
         test_pricing()
         test_usage(tmp)
+        test_validator()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

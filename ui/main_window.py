@@ -18,12 +18,12 @@ from PyQt6.QtWidgets import (
 )
 
 from core.config import AppConfig, ConfigStore
-from core.models import Item, WorldState
+from core.debuglog import LOG
+from core.models import WorldState
 from core.savegame import (
     GameSave,
     HistoryLog,
     PlayerState,
-    SaveFormatError,
     SaveStore,
 )
 from core.usage import UsageTracker
@@ -35,6 +35,7 @@ from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
 from ui.usage_dialog import UsageDialog
+from ui.validate_dialog import ValidateDialog
 from ui.world_doc_dialog import WorldDocDialog
 from ui.world_panel import WorldPanel
 
@@ -54,6 +55,8 @@ class MainWindow(QMainWindow):
         self._save_store = SaveStore()
         self._usage = UsageTracker()
         self._usage.load()
+        # 让全局日志器的开关与配置保持一致
+        LOG.set_enabled(self._config.debug_log)
         #: 当前生效的世界观文档，导入或读档后填充
         self._world: WorldDocument | None = None
         #: 玩家信息与历史摘要，构成存档的核心内容
@@ -135,6 +138,16 @@ class MainWindow(QMainWindow):
         self.act_usage.setStatusTip("查看 token 消耗与估算花费")
         self.act_usage.triggered.connect(self._on_usage)
         settings_menu.addAction(self.act_usage)
+
+        # ---------- 工具 ----------
+        tools_menu = bar.addMenu("工具")
+
+        self.act_validate = QAction("世界观一致性校验…", self)
+        self.act_validate.setStatusTip(
+            "测试 AI 生成的内容是否会因违背世界观而被拦截并重试"
+        )
+        self.act_validate.triggered.connect(self._on_validate)
+        tools_menu.addAction(self.act_validate)
 
         # ---------- 帮助 ----------
         help_menu = bar.addMenu("帮助")
@@ -338,11 +351,13 @@ class MainWindow(QMainWindow):
                 self, "保存失败", f"无法写入配置文件：\n{exc}"
             )
 
+        LOG.set_enabled(enabled)
+
         state = "开启" if enabled else "关闭"
         self.status_mode.setText(f"调试日志已{state}")
         if enabled:
             self.story_panel.append_system(
-                "调试日志已开启（日志记录功能将在阶段 10 写入文件）"
+                f"调试日志已开启，校验冲突与网络异常将记录到 {LOG.path}"
             )
 
     # ---- 世界观 ----
@@ -545,6 +560,19 @@ class MainWindow(QMainWindow):
 
     def _on_usage(self) -> None:
         dialog = UsageDialog(self._usage, self._config.usd_to_cny, self)
+        dialog.exec()
+        self._refresh_usage_label()
+
+    def _on_validate(self) -> None:
+        dialog = ValidateDialog(
+            self._config,
+            self._world,
+            player=self._player,
+            state=self._world_state,
+            history=self._history,
+            tracker=self._usage,
+            parent=self,
+        )
         dialog.exec()
         self._refresh_usage_label()
 
