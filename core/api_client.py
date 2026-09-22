@@ -17,6 +17,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from core.debuglog import LOG
 from core.config import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
@@ -192,6 +193,31 @@ def _classify_network_error(exc: Exception, url: str = "") -> ApiError:
     )
 
 
+#: 网络类错误用警告级，其余（鉴权、余额等）用错误级
+_WARN_KINDS = {"network", "rate_limit", "server"}
+
+
+def _log_api_error(url: str, error: "ApiError", *, streamed: bool = False) -> None:
+    """把 API 异常记进调试日志。
+
+    这是「网络异常捕获」的一半 —— 另一半是把异常翻译成可读文案。
+    只翻译不记录的话，用户遇到间歇性网络问题时无从查起。
+    """
+    level = "warn" if error.kind in _WARN_KINDS else "error"
+    header = (
+        f"{url}　{'流式' if streamed else '一次性'}　"
+        f"类型={error.kind}　状态码={error.status if error.status is not None else '-'}"
+    )
+    detail = error.message
+    if error.detail:
+        detail = f"{detail}\n\n原始响应：\n{error.detail}"
+
+    if level == "warn":
+        LOG.warn("网络", header, detail)
+    else:
+        LOG.error("接口", header, detail)
+
+
 def _resolve_thinking(value: str | bool | None) -> bool | None:
     """把 thinking 参数归一成 True / False / None。
 
@@ -287,6 +313,17 @@ class DeepSeekClient:
             url, data=body, headers=headers, method=method
         )
 
+        started = time.perf_counter()
+        if payload is not None:
+            LOG.llm_request(
+                url,
+                self.model,
+                payload.get("messages") or [],
+                stream=False,
+                json_mode="response_format" in payload,
+                max_tokens=payload.get("max_tokens"),
+            )
+
         try:
             with urllib.request.urlopen(
                 request, timeout=timeout or self.timeout
@@ -299,13 +336,21 @@ class DeepSeekClient:
                 detail = exc.read().decode("utf-8", errors="replace")
             except Exception:  # noqa: BLE001 - 读不到 body 不影响主流程
                 pass
-            raise _classify_http_error(exc.code, detail) from exc
+            error = _classify_http_error(exc.code, detail)
+            _log_api_error(url, error)
+            raise error from exc
         except urllib.error.URLError as exc:
-            raise _classify_network_error(exc, url) from exc
+            error = _classify_network_error(exc, url)
+            _log_api_error(url, error)
+            raise error from exc
         except (socket.timeout, TimeoutError) as exc:
-            raise _classify_network_error(exc, url) from exc
+            error = _classify_network_error(exc, url)
+            _log_api_error(url, error)
+            raise error from exc
         except OSError as exc:
-            raise _classify_network_error(exc, url) from exc
+            error = _classify_network_error(exc, url)
+            _log_api_error(url, error)
+            raise error from exc
 
         if not raw.strip():
             return {}
@@ -313,12 +358,33 @@ class DeepSeekClient:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
+            LOG.llm_response(
+                self.model,
+                raw,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                finish_reason="（返回内容不是合法 json）",
+            )
             raise ApiError(
                 "服务端返回的内容不是合法 JSON。\n\n"
                 "常见原因是网络中间有拦截页面，或 Base URL 指向了非 API 地址。",
                 kind="format",
                 detail=raw[:500],
             ) from exc
+
+        if payload is not None:
+            choices = parsed.get("choices") if isinstance(parsed, dict) else None
+            content = ""
+            if isinstance(choices, list) and choices:
+                content = str((choices[0].get("message") or {}).get("content") or "")
+            LOG.llm_response(
+                self.model,
+                content or json.dumps(parsed, ensure_ascii=False),
+                parsed.get("usage") if isinstance(parsed, dict) else None,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                finish_reason=str(choices[0].get("finish_reason") or "")
+                if isinstance(choices, list) and choices
+                else "",
+            )
 
         return parsed if isinstance(parsed, dict) else {"data": parsed}
 
@@ -415,6 +481,15 @@ class DeepSeekClient:
         )
 
         started = time.perf_counter()
+        LOG.llm_request(
+            url,
+            self.model,
+            messages,
+            stream=True,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+        )
+
         pieces: list[str] = []
         usage: dict = {}
         finish_reason = ""
@@ -464,16 +539,33 @@ class DeepSeekClient:
                 detail = exc.read().decode("utf-8", errors="replace")
             except Exception:  # noqa: BLE001
                 pass
-            raise _classify_http_error(exc.code, detail) from exc
+            error = _classify_http_error(exc.code, detail)
+            _log_api_error(url, error)
+            raise error from exc
         except urllib.error.URLError as exc:
-            raise _classify_network_error(exc, url) from exc
+            error = _classify_network_error(exc, url)
+            _log_api_error(url, error)
+            raise error from exc
         except (socket.timeout, TimeoutError) as exc:
-            raise _classify_network_error(exc, url) from exc
+            error = _classify_network_error(exc, url)
+            _log_api_error(url, error)
+            raise error from exc
         except OSError as exc:
-            raise _classify_network_error(exc, url) from exc
+            error = _classify_network_error(exc, url)
+            _log_api_error(url, error)
+            raise error from exc
 
         latency = int((time.perf_counter() - started) * 1000)
         content = "".join(pieces)
+
+        LOG.llm_response(
+            self.model,
+            content,
+            usage,
+            latency_ms=latency,
+            finish_reason=finish_reason,
+            streamed=True,
+        )
 
         return ChatResult(
             content=content,

@@ -28,6 +28,14 @@ MEMORY_LIMIT = 500
 #: 单个字段写入文件时的截断长度，避免一次异常把日志撑爆
 MAX_FIELD_CHARS = 4000
 
+#: 发给 AI 的 prompt / 返回内容的截断长度。
+#: 比普通字段宽得多 —— prompt 里含世界观原文 + 世界状态 + 历史摘要，
+#: 截太短就失去了「记录每一次发给 AI 的 prompt」的意义
+MAX_LLM_CHARS = 20000
+
+#: 日志文件大小上限，超过就轮转成 debug.log.1（只保留一代）
+MAX_FILE_BYTES = 4 * 1024 * 1024
+
 
 @dataclass
 class LogEntry:
@@ -84,13 +92,71 @@ class DebugLog:
         )
         return self._write("error", tag, message, detail)
 
-    def _write(self, level: str, tag: str, message: str, detail: str) -> LogEntry:
+    # ---------- AI 收发记录 ----------
+
+    def llm_request(
+        self,
+        url: str,
+        model: str,
+        messages: list[dict],
+        *,
+        stream: bool = False,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+    ) -> LogEntry | None:
+        """记录一次完整的请求。
+
+        刻意只在日志开启时才构造内容 —— prompt 动辄上万字，
+        没开日志还每次拼一遍纯属浪费。
+        """
+        if not self.enabled:
+            return None
+
+        body = "\n\n".join(
+            f"--- {message.get('role', '?')} ---\n{message.get('content', '')}"
+            for message in messages
+        )
+        header = (
+            f"{url}　model={model}　流式={stream}　json={json_mode}"
+            f"　max_tokens={max_tokens}"
+        )
+        return self._write("info", "发送", header, body, limit=MAX_LLM_CHARS)
+
+    def llm_response(
+        self,
+        model: str,
+        content: str,
+        usage: dict | None = None,
+        *,
+        latency_ms: int = 0,
+        finish_reason: str = "",
+        streamed: bool = False,
+    ) -> LogEntry | None:
+        """记录一次返回。"""
+        if not self.enabled:
+            return None
+
+        usage = usage or {}
+        header = (
+            f"model={model}　{'流式' if streamed else '一次性'}　耗时={latency_ms}ms"
+            f"　finish={finish_reason or '-'}"
+            f"　tokens={usage.get('prompt_tokens', '?')}"
+            f"+{usage.get('completion_tokens', '?')}"
+        )
+        return self._write("info", "返回", header, content, limit=MAX_LLM_CHARS)
+
+    # ---------- 底层写入 ----------
+
+    def _write(
+        self, level: str, tag: str, message: str, detail: str, limit: int | None = None
+    ) -> LogEntry:
+        limit = limit or MAX_FIELD_CHARS
         entry = LogEntry(
             at=datetime.now().isoformat(timespec="seconds"),
             level=level,
             tag=tag,
-            message=_clip(message),
-            detail=_clip(detail),
+            message=_clip(message, limit),
+            detail=_clip(detail, limit),
         )
 
         with self._lock:
@@ -105,10 +171,30 @@ class DebugLog:
     def _append_to_file(self, entry: LogEntry) -> None:
         try:
             ensure_dirs()
+            self._rotate_if_needed()
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(entry.to_line() + "\n")
         except OSError:
             # 日志写不进去绝不能影响正常游玩，静默降级
+            pass
+
+    def _rotate_if_needed(self) -> None:
+        """文件超过上限就轮转。
+
+        不轮转的话，开着日志长时间游玩会把磁盘写满 ——
+        每一轮都要记录完整的 prompt 与返回。
+        """
+        try:
+            if self.path.stat().st_size <= MAX_FILE_BYTES:
+                return
+        except OSError:
+            return  # 文件还不存在
+
+        backup = self.path.with_name(self.path.name + ".1")
+        try:
+            backup.unlink(missing_ok=True)
+            self.path.rename(backup)
+        except OSError:
             pass
 
     # ---------- 读取 ----------
@@ -134,11 +220,11 @@ class DebugLog:
             return False
 
 
-def _clip(text: str) -> str:
+def _clip(text: str, limit: int = MAX_FIELD_CHARS) -> str:
     text = str(text)
-    if len(text) <= MAX_FIELD_CHARS:
+    if len(text) <= limit:
         return text
-    return text[:MAX_FIELD_CHARS] + f"…（已截断，原文 {len(text)} 字）"
+    return text[:limit] + f"…（已截断，原文 {len(text)} 字）"
 
 
 #: 全局日志器。各模块直接 import 这个用，避免到处传递引用。

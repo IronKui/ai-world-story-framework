@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
@@ -37,6 +39,7 @@ from ui.action_panel import ActionPanel
 from ui.event_dialog import EventDialog
 from ui.inventory_panel import InventoryPanel
 from ui.item_gen_dialog import ItemGenDialog
+from ui.log_dialog import LogDialog
 from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
@@ -169,6 +172,15 @@ class MainWindow(QMainWindow):
         )
         self.act_gen_event.triggered.connect(self._on_generate_event)
         tools_menu.addAction(self.act_gen_event)
+
+        tools_menu.addSeparator()
+
+        self.act_log_viewer = QAction("调试日志…", self)
+        self.act_log_viewer.setStatusTip(
+            "查看发给 AI 的 prompt、返回内容、校验冲突与网络异常"
+        )
+        self.act_log_viewer.triggered.connect(self._on_log_viewer)
+        tools_menu.addAction(self.act_log_viewer)
 
         # ---------- 帮助 ----------
         help_menu = bar.addMenu("帮助")
@@ -426,22 +438,32 @@ class MainWindow(QMainWindow):
         self._thread = None
 
     def _on_turn_done(self, result) -> None:
+        """回合结束。渲染本身出错也必须先把界面恢复可交互状态，
+        否则玩家会卡在「生成中」动不了。"""
         self._turns += 1
-        self._render_turn(result)
+        try:
+            self._render_turn(result)
+        except Exception:  # noqa: BLE001
+            LOG.exception(
+                "界面", "渲染回合结果时出错，本回合内容可能显示不完整", sys.exc_info()[1]
+            )
+        finally:
+            self._restore_after_turn()
 
+        # 换上新一批行动选项
+        self.action_panel.set_options(result.event.options)
+        self.action_panel.focus_input()
+
+    def _restore_after_turn(self) -> None:
+        """把界面恢复到可交互状态。回合的每条退出路径都要经过这里。"""
         self._refresh_usage_label()
         self._refresh_status()
         self.action_panel.set_busy(False)
         self.inventory_panel.set_actions_enabled(True)
         self.status_mode.setText(f"第 {self._turns} 回合")
 
-        # 换上新一批行动选项
-        self.action_panel.set_options(result.event.options)
-        self.action_panel.focus_input()
-
     def _on_turn_failed(self, error) -> None:
-        self.action_panel.set_busy(False)
-        self.inventory_panel.set_actions_enabled(True)
+        self._restore_after_turn()
         self.status_mode.setText("已中断")
 
         if isinstance(error, ValidationExhausted):
@@ -889,6 +911,10 @@ class MainWindow(QMainWindow):
         dialog = UsageDialog(self._usage, self._config.usd_to_cny, self)
         dialog.exec()
         self._refresh_usage_label()
+
+    def _on_log_viewer(self) -> None:
+        dialog = LogDialog(LOG, self)
+        dialog.exec()
 
     def _on_validate(self) -> None:
         dialog = ValidateDialog(

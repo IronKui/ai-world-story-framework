@@ -14,6 +14,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import threading
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -1105,6 +1106,218 @@ def test_events() -> None:
 
 
 # ----------------------------------------------------------------------
+# 阶段 10：调试日志
+# ----------------------------------------------------------------------
+
+
+def test_debuglog(tmp: pathlib.Path) -> None:
+    from core.debuglog import (
+        LOG,
+        MAX_FIELD_CHARS,
+        MAX_FILE_BYTES,
+        MAX_LLM_CHARS,
+        DebugLog,
+    )
+
+    log = DebugLog(path=tmp / "debug.log")
+
+    # ---------- 默认关闭时不落盘，但内存仍记录 ----------
+    check("阶段10 默认不落盘", not log.enabled)
+    log.info("测试", "这条只应该在内存里")
+    check("阶段10 关闭时仍入内存", len(log.entries()) == 1)
+    check("阶段10 关闭时不写文件", not (tmp / "debug.log").exists())
+
+    # ---------- 开启后落盘 ----------
+    log.set_enabled(True)
+    log.info("测试", "开启后的记录", "附加内容")
+    text = (tmp / "debug.log").read_text(encoding="utf-8")
+    check("阶段10 开启后写文件", "开启后的记录" in text)
+    check("阶段10 附加内容一并写入", "附加内容" in text)
+    check("阶段10 文件含级别标记", "[INFO ]" in text)
+
+    # ---------- AI 收发记录 ----------
+    before = len(log.entries())
+    log.llm_request(
+        "https://api.deepseek.com/chat/completions",
+        "deepseek-flash",
+        [{"role": "system", "content": "你是助手"}, {"role": "user", "content": "你好"}],
+        stream=True,
+        json_mode=True,
+        max_tokens=100,
+    )
+    log.llm_response(
+        "deepseek-flash", "回复内容", {"prompt_tokens": 10, "completion_tokens": 5},
+        latency_ms=123, finish_reason="stop", streamed=True,
+    )
+    check("阶段10 请求已记录", len(log.entries()) == before + 2)
+
+    request_entry = log.entries()[-2]
+    check("阶段10 请求含完整消息", "你是助手" in request_entry.detail and "你好" in request_entry.detail)
+    check("阶段10 请求含调用参数", "流式=True" in request_entry.message and "max_tokens=100" in request_entry.message)
+
+    response_entry = log.entries()[-1]
+    check("阶段10 返回含内容", "回复内容" in response_entry.detail)
+    check("阶段10 返回含用量", "10+5" in response_entry.message and "123ms" in response_entry.message)
+
+    # 关掉后不该再构造大字符串
+    log.set_enabled(False)
+    check(
+        "阶段10 关闭时不记录 AI 收发",
+        log.llm_request("u", "m", [{"role": "user", "content": "x"}]) is None
+        and log.llm_response("m", "x") is None,
+    )
+
+    # ---------- 截断 ----------
+    huge = DebugLog(path=tmp / "huge.log")
+    huge.set_enabled(True)
+    huge.info("测试", "短", "x" * 50000)
+    check(
+        "阶段10 普通字段按 MAX_FIELD_CHARS 截断",
+        len(huge.entries()[-1].detail) < MAX_FIELD_CHARS + 40,
+    )
+
+    huge.llm_response("m", "y" * 60000)
+    check(
+        "阶段10 prompt 用更宽的 MAX_LLM_CHARS",
+        len(huge.entries()[-1].detail) < MAX_LLM_CHARS + 40,
+    )
+
+    # ---------- 文件轮转 ----------
+    rotate = DebugLog(path=tmp / "rotate.log")
+    rotate.set_enabled(True)
+    rotate.info("测试", "轮转前")
+    # 直接把文件撑到上限之上
+    (tmp / "rotate.log").write_text("x" * (MAX_FILE_BYTES + 1), encoding="utf-8")
+    rotate.info("测试", "轮转后")
+    check("阶段10 超限后轮转出备份", (tmp / "rotate.log.1").exists())
+    check(
+        "阶段10 轮转后新文件只含新记录",
+        "轮转后" in (tmp / "rotate.log").read_text(encoding="utf-8"),
+    )
+
+    # ---------- 异常记录 ----------
+    try:
+        raise ValueError("模拟异常")
+    except ValueError as exc:
+        entry = rotate.exception("测试", "出错了", exc)
+    check("阶段10 异常带完整堆栈", "Traceback" in entry.detail and "模拟异常" in entry.detail)
+
+    # ---------- 清理 ----------
+    rotate.clear()
+    check("阶段10 清空内存", len(rotate.entries()) == 0)
+    check("阶段10 删除文件", rotate.clear_file() and not rotate.path.exists())
+
+    # 内存上限
+    cap = DebugLog(path=tmp / "cap.log")
+    for i in range(700):
+        cap.info("测试", f"第 {i} 条")
+    check("阶段10 内存有上限", len(cap.entries()) <= 500, str(len(cap.entries())))
+    check("阶段10 保留的是最新的", "第 699 条" in cap.entries()[-1].message)
+
+    # 全局日志器存在且默认关闭（不能悄悄记录玩家的游玩内容）
+    check("阶段10 全局日志器默认关闭", not LOG.enabled)
+
+
+def test_api_error_logging() -> None:
+    """API 异常必须落进调试日志。
+
+    「网络异常捕获」有两半：把异常翻译成可读文案，
+    以及把异常记录下来。只翻译不记录的话，
+    用户遇到间歇性网络问题时无从查起。
+    """
+    from core.api_client import (
+        ApiError,
+        _classify_http_error,
+        _classify_network_error,
+        _log_api_error,
+    )
+    from core.debuglog import LOG
+
+    before = len(LOG.entries())
+
+    network = _classify_network_error(OSError("boom"), "https://example.test/x")
+    _log_api_error("https://example.test/x", network)
+    network_entry = LOG.entries()[-1]
+    check("阶段10 网络异常记为警告", network_entry.level == "warn")
+    check("阶段10 网络异常带目标地址", "example.test" in network_entry.message)
+    check("阶段10 网络异常带错误类型", "类型=network" in network_entry.message)
+
+    auth = _classify_http_error(401, '{"error":{"message":"Authentication Fails"}}')
+    _log_api_error("https://example.test/x", auth)
+    auth_entry = LOG.entries()[-1]
+    check("阶段10 鉴权失败记为错误", auth_entry.level == "error")
+    check("阶段10 鉴权失败带状态码", "状态码=401" in auth_entry.message)
+    check("阶段10 保留服务端原文", "Authentication Fails" in auth_entry.detail)
+
+    check("阶段10 两次异常都记下了", len(LOG.entries()) == before + 2)
+
+    # 各错误类型都要能翻译出可读文案，不能漏出原始异常
+    cases = {
+        402: "quota",
+        429: "rate_limit",
+        503: "server",
+    }
+    for status, kind in cases.items():
+        error = _classify_http_error(status, "")
+        check(
+            f"阶段10 状态码 {status} 分类为 {kind}",
+            error.kind == kind and len(error.message) > 10,
+        )
+
+    # 未分类的状态码也要给出可读文案，而不是空字符串
+    unknown = _classify_http_error(418, "")
+    check("阶段10 未知状态码有兜底文案", len(unknown.message) > 5)
+
+
+def test_excepthook_installed() -> None:
+    """入口模块必须安装全局兜底。
+
+    实测：不装的话，PyQt6 会在槽函数抛未捕获异常时直接 abort 进程
+    （退出码 127、无堆栈、无输出），用户看到的是窗口凭空消失。
+    """
+    import main as app_main
+    from core.debuglog import LOG
+
+    check("阶段10 入口暴露 install_excepthook", hasattr(app_main, "install_excepthook"))
+
+    original = sys.excepthook
+    original_thread = threading.excepthook
+    original_box = app_main.QMessageBox
+
+    # 必须把弹窗打桩掉：本测试进程里没有 QApplication，
+    # 直接构造 QMessageBox 会让 Qt abort 掉整个测试进程。
+    # 这也说明这个兜底的弹窗只能在真实应用里验证 —— 见下面的说明。
+    class _StubBox:
+        shown: list[str] = []
+
+        @staticmethod
+        def critical(*args, **kwargs):
+            _StubBox.shown.append(str(args[2]) if len(args) > 2 else "")
+            return None
+
+    try:
+        app_main.QMessageBox = _StubBox
+        app_main.install_excepthook()
+
+        check("阶段10 sys.excepthook 已被替换", sys.excepthook is not original)
+        check("阶段10 线程兜底已安装", threading.excepthook is not original_thread)
+
+        # 兜底本身不能抛异常，且要触发提示
+        try:
+            sys.excepthook(ValueError, ValueError("模拟崩溃"), None)
+            check("阶段10 兜底处理异常不抛出", True)
+        except BaseException:  # noqa: BLE001
+            check("阶段10 兜底处理异常不抛出", False)
+
+        check("阶段10 兜底弹窗带指引", bool(_StubBox.shown) and "调试日志" in _StubBox.shown[0])
+        check("阶段10 崩溃写进了日志", any("模拟崩溃" in e.message for e in LOG.entries()))
+    finally:
+        sys.excepthook = original
+        threading.excepthook = original_thread
+        app_main.QMessageBox = original_box
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -1136,6 +1349,9 @@ def main() -> int:
         test_items()
         test_doom()
         test_events()
+        test_debuglog(tmp)
+        test_api_error_logging()
+        test_excepthook_installed()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
