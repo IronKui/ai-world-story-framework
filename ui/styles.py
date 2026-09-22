@@ -186,6 +186,9 @@ QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBo
     border-color: $accent;
 }
 QLineEdit:disabled, QPlainTextEdit:disabled { color: $text_faint; }
+/* 右侧要给原生上下按钮留位，否则文字（含后缀）会压到箭头上 */
+QSpinBox { padding-right: 22px; }
+
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView {
     background: $bg_elev;
@@ -297,13 +300,25 @@ QGroupBox::title {
 }
 
 QCheckBox { spacing: 8px; }
+/* 未勾选态必须比 $border 明显亮，否则在深色面板上等于隐形 */
 QCheckBox::indicator {
     width: 16px; height: 16px;
-    border: 1px solid $border;
+    border: 1px solid #6e7891;
     border-radius: 4px;
-    background: $bg_input;
+    background: $bg_elev;
 }
-QCheckBox::indicator:checked { background: $accent; border-color: $accent; }
+QCheckBox::indicator:hover { border-color: $accent; }
+QCheckBox::indicator:checked {
+    background: $accent;
+    border-color: $accent;
+}
+QCheckBox::indicator:disabled { border-color: $border_soft; }
+
+/* ---------- 数值输入框 ----------
+   刻意不覆盖 QSpinBox 的 up/down-button / arrow 子控件：
+   一旦覆盖，Qt 就不再绘制默认箭头，而 QSS 又没有可行的替代画法
+   （浏览器那套 border 拼三角形在 Qt 里会渲染成实心方块）。
+   所以字段外观走上面的通用规则，箭头交给 Qt 原生绘制。 */
 """
 )
 

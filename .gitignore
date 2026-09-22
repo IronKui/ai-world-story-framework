@@ -26,5 +26,6 @@ Thumbs.db
 desktop.ini
 
 # ---------- 临时文件 ----------
-_shot.png
-_smoke.py
+# 开发期用的冒烟测试 / 截图脚本，一律下划线开头
+_*.py
+_*.png

@@ -17,10 +17,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.config import AppConfig, ConfigStore
 from core.models import Item, WorldState
 from ui import styles
 from ui.action_panel import ActionPanel
 from ui.inventory_panel import InventoryPanel
+from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
 from ui.world_panel import WorldPanel
 
@@ -33,13 +35,18 @@ class MainWindow(QMainWindow):
         self.resize(1360, 880)
         self.setMinimumSize(1080, 700)
 
+        # 配置要在建菜单栏之前读：调试日志勾选项的初始状态依赖它
+        self._config_store = ConfigStore()
+        self._config: AppConfig = self._config_store.load()
+
         self._build_menubar()
         self._build_body()
         self._build_statusbar()
         self._connect_signals()
+        self._refresh_status()
 
-        # 阶段 1 演示数据：接入 AI 后由 core 层填充
-        self._load_stage1_demo()
+        # 演示数据：接入 AI 后由 core 层填充
+        self._load_demo_content()
 
     # ------------------------------------------------------------------
     # 菜单栏
@@ -75,13 +82,17 @@ class MainWindow(QMainWindow):
         # ---------- 设置 ----------
         settings_menu = bar.addMenu("设置")
 
-        self.act_api = self._make_action(
-            settings_menu, "API 设置…", "Ctrl+,", "阶段 2 实现"
-        )
+        self.act_api = QAction("API 设置…", self)
+        self.act_api.setShortcut(QKeySequence("Ctrl+,"))
+        self.act_api.setStatusTip("配置 DeepSeek API Key 与模型")
+        self.act_api.triggered.connect(self._on_api_settings)
+        settings_menu.addAction(self.act_api)
+
         settings_menu.addSeparator()
 
         self.act_debug_log = QAction("开启调试日志", self)
         self.act_debug_log.setCheckable(True)
+        self.act_debug_log.setChecked(self._config.debug_log)
         self.act_debug_log.setToolTip("记录每一次发给 AI 的 prompt 与返回结果")
         self.act_debug_log.toggled.connect(self._on_debug_log_toggled)
         settings_menu.addAction(self.act_debug_log)
@@ -196,6 +207,13 @@ class MainWindow(QMainWindow):
 
     def _on_option_chosen(self, text: str) -> None:
         self.story_panel.append_player_action(text)
+
+        # 阶段 2 临时路由：让演示选项能直接打开设置窗口。
+        # 阶段 9 主循环接管后，这里统一改成把选项发给 AI 结算。
+        if text.startswith("打开 API 设置"):
+            self._on_api_settings()
+            return
+
         self._todo("行动结算", "阶段 9 实现（主循环）")
 
     def _on_free_input(self, text: str) -> None:
@@ -230,10 +248,61 @@ class MainWindow(QMainWindow):
         self.inventory_panel.remove_item(item_id)
         self.story_panel.append_system(f"丢弃了：{item.name}")
 
+    # ---- 设置 ----
+
+    def _on_api_settings(self) -> None:
+        dialog = ApiSettingsDialog(self._config, self)
+        if dialog.exec() != ApiSettingsDialog.DialogCode.Accepted:
+            return
+
+        config = dialog.current_config()
+        try:
+            self._config_store.save(config)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "保存失败",
+                f"无法写入配置文件：\n{exc}\n\n本次修改仅对当前运行有效。",
+            )
+        else:
+            self.story_panel.append_system("API 设置已保存到本地配置文件")
+
+        self._config = config
+        self._refresh_status()
+
     def _on_debug_log_toggled(self, enabled: bool) -> None:
+        self._config.debug_log = enabled
+        try:
+            self._config_store.save(self._config)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "保存失败", f"无法写入配置文件：\n{exc}"
+            )
+
         state = "开启" if enabled else "关闭"
         self.status_mode.setText(f"调试日志已{state}")
-        self._todo(f"调试日志{state}", "阶段 10 实现（日志）")
+        if enabled:
+            self.story_panel.append_system(
+                "调试日志已开启（日志记录功能将在阶段 10 写入文件）"
+            )
+
+    def _refresh_status(self) -> None:
+        """刷新状态栏的「世界观 / API」两段状态。"""
+        if self._config.has_api_key:
+            self.status_api.setText(f"API：已配置（{self._config.masked_key()}）")
+            self.status_api.setStyleSheet(
+                f"color:{styles.COLORS['success']}; font-size:12px;"
+            )
+            self.status_api.setToolTip(
+                f"接口地址：{self._config.normalized_base_url()}\n"
+                f"模型：{self._config.model}"
+            )
+        else:
+            self.status_api.setText("API：未配置")
+            self.status_api.setStyleSheet(
+                f"color:{styles.COLORS['warning']}; font-size:12px;"
+            )
+            self.status_api.setToolTip("点击菜单「设置 → API 设置」填入 DeepSeek API Key")
 
     # ------------------------------------------------------------------
     # 占位与演示
@@ -259,25 +328,33 @@ class MainWindow(QMainWindow):
             "<span style='color:#8b94a8'>当前进度：阶段 1 / 10 —— 窗体 UI 框架</span>",
         )
 
-    def _load_stage1_demo(self) -> None:
-        """阶段 1 演示内容，阶段 9 会被真实的 AI 开场替换。"""
+    def _load_demo_content(self) -> None:
+        """演示内容，阶段 9 会被真实的 AI 开场替换。"""
         story = self.story_panel
-        story.append_system("阶段 1：界面框架已就绪，尚未接入 AI")
+        story.append_system("界面框架与本地配置已就绪")
         story.append_narrative(
             "程序已启动。你现在看到的是一套空的世界容器——没有预设地图、"
             "没有写死的道具表、也没有写死的事件脚本。\n\n"
             "导入一份世界观文档之后，世界才会真正开始运转。"
         )
 
-        story.append_dialog(
-            "系统", "「导入世界观文档」与「API 设置」将在后续阶段开放。"
-        )
+        if self._config.has_api_key:
+            story.append_dialog(
+                "系统",
+                f"已读取本地配置，API Key（{self._config.masked_key()}）就绪。"
+                "可在「设置 → API 设置」中测试连通性。",
+            )
+        else:
+            story.append_dialog(
+                "系统",
+                "尚未配置 DeepSeek API Key。请打开「设置 → API 设置」填入后再继续。",
+            )
 
         self.action_panel.set_options(
             [
-                "查看当前界面框架",
+                "打开 API 设置，配置 DeepSeek Key",
                 "导入世界观文档（阶段 3）",
-                "配置 DeepSeek API Key（阶段 2）",
+                "查看当前界面框架",
             ]
         )
 
