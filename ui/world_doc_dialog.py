@@ -148,6 +148,13 @@ class WorldDocDialog(QDialog):
         self.generate_button.setEnabled(self._config is not None)
         buttons.addWidget(self.generate_button)
 
+        self.sample_button = QPushButton("导入示例")
+        self.sample_button.setToolTip(
+            "随程序附带的一份设定，用来先体验一下。不需要 API Key"
+        )
+        self.sample_button.clicked.connect(self._on_import_sample)
+        buttons.addWidget(self.sample_button)
+
         self.import_button = QPushButton("导入文档…")
         self.import_button.clicked.connect(self._on_import)
         buttons.addWidget(self.import_button)
@@ -313,6 +320,34 @@ class WorldDocDialog(QDialog):
     # ------------------------------------------------------------------
     # 操作
     # ------------------------------------------------------------------
+
+    def _on_import_sample(self) -> None:
+        """导入随包附带的示例设定。
+
+        存在的意义是：用户配好 API Key 之后不必先花时间生成一份设定
+        才能看到游戏长什么样。也不需要 API Key。
+        """
+        from core.paths import ASSETS_DIR
+
+        sample = ASSETS_DIR / "示例世界观-眠神纪.md"
+        if not sample.is_file():
+            QMessageBox.warning(
+                self,
+                "找不到示例文档",
+                f"程序目录下没有找到示例设定：\n{sample}\n\n"
+                "可能是安装不完整，请重新安装，或者用「用 AI 生成…」自己写一份。",
+            )
+            return
+
+        try:
+            document = import_world_file(sample)
+            self._store.save(document)
+        except (WorldImportError, OSError) as exc:
+            QMessageBox.warning(self, "导入失败", f"无法导入示例设定：\n{exc}")
+            return
+
+        self._reload_list(select=document)
+        self._render_detail(document)
 
     def _on_generate(self) -> None:
         """用大白话生成一份新设定。

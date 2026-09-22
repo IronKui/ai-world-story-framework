@@ -1638,6 +1638,65 @@ def test_worldgen() -> None:
 
 
 # ----------------------------------------------------------------------
+# 随包资源
+# ----------------------------------------------------------------------
+
+
+def test_assets() -> None:
+    """随包发布的资源必须存在、可解析。
+
+    打包脚本如果把 assets 漏了，用户点「导入示例」会报错 ——
+    这条测试就是防这个的。
+    """
+    from core.paths import ASSETS_DIR
+    from core.worldgen import check_structure
+
+    check("资源目录存在", ASSETS_DIR.is_dir(), str(ASSETS_DIR))
+
+    sample = ASSETS_DIR / "示例世界观-眠神纪.md"
+    check("示例世界观存在", sample.is_file(), str(sample))
+
+    if sample.is_file():
+        document = import_world_file(sample)
+        # 示例必须能被解析器接受，否则用户点了导入反而报错
+        passed, problem = check_structure(document.text)
+        check("示例世界观结构合规", passed, problem)
+        check("示例世界观不需要压缩", not document.needs_compression())
+        check("示例世界观有名字", bool(document.name))
+
+        # 走一遍真实导入链路
+        import tempfile as _tmp
+
+        from core.world import WorldStore as _WS
+
+        with _tmp.TemporaryDirectory() as folder:
+            repo = _WS(directory=pathlib.Path(folder))
+            saved = repo.save(document)
+            restored = repo._load_path(saved)
+            check(
+                "示例世界观能存进仓库并读回",
+                restored is not None and restored.text == document.text,
+            )
+
+    prompt_doc = ASSETS_DIR / "世界观生成提示词.md"
+    check("提示词文档存在", prompt_doc.is_file(), str(prompt_doc))
+
+    if prompt_doc.is_file():
+        # 文档里的格式要求必须和程序实际用的约束一致，
+        # 否则用户照着文档生成的文档会被程序拒收
+        from core.worldgen import MAX_CHARS, MIN_CHARS, MIN_SECTIONS
+
+        text = prompt_doc.read_text(encoding="utf-8-sig")
+        check("提示词文档含字数区间", str(MIN_CHARS) in text and str(MAX_CHARS) in text)
+        check("提示词文档含分节要求", f"至少 {MIN_SECTIONS} 个" in text)
+        check("提示词文档说明必须 UTF-8", "UTF-8" in text)
+        check(
+            "提示词文档写明不写剧情",
+            "不要写：主角" in text or "不要把剧情写进设定" in text,
+        )
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -1676,6 +1735,7 @@ def main() -> int:
         test_theme_switching()
         test_background()
         test_worldgen()
+        test_assets()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
