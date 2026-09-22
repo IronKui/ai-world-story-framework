@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from core.config import ConfigStore  # noqa: E402
+from core.paths import ensure_dirs  # noqa: E402
 from core.debuglog import LOG  # noqa: E402
 from core.version import APP_NAME, APP_VERSION  # noqa: E402
 from ui import styles  # noqa: E402
@@ -79,11 +80,95 @@ def install_excepthook() -> None:
     threading.excepthook = thread_handler
 
 
+def run_selftest() -> int:
+    """自检：打印环境与路径信息，写完就退出。
+
+    存在的意义有两个：
+      · 打包后的程序排查问题 —— 用户截图发过来就能看出数据写到哪了、
+        示例文档在不在、Python 和 Qt 是什么版本
+      · 让打包产物可被自动验证 —— 窗口程序没有控制台，
+        必须有这么一条能拿到输出的路径
+
+    用法：AIWorldStoryFramework.exe --selftest
+    """
+    from core.paths import (
+        ASSETS_DIR,
+        CONFIG_FILE,
+        DATA_DIR,
+        RESOURCE_DIR,
+        ROOT,
+        ensure_dirs,
+        is_portable,
+    )
+
+    lines = [
+        f"{APP_NAME} v{APP_VERSION}",
+        "=" * 56,
+        f"运行形态      : {'打包运行' if is_portable() else '源码运行'}",
+        f"Python        : {sys.version.split()[0]}",
+        f"可执行文件目录 : {ROOT}",
+        f"资源目录      : {RESOURCE_DIR}",
+        f"数据目录      : {DATA_DIR}",
+        f"配置文件      : {CONFIG_FILE}",
+        f"示例文档目录  : {ASSETS_DIR}",
+        "",
+    ]
+
+    # ---- 可写性 ----
+    try:
+        ensure_dirs()
+        probe = DATA_DIR / ".write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        lines.append("数据目录可写  : 是")
+    except OSError as exc:
+        lines.append(f"数据目录可写  : 否 —— {exc}")
+
+    # ---- 随包资源 ----
+    lines.append("")
+    lines.append("随包资源：")
+    if ASSETS_DIR.is_dir():
+        for item in sorted(ASSETS_DIR.iterdir()):
+            size = item.stat().st_size / 1024
+            lines.append(f"  · {item.name}（{size:.0f} KB）")
+    else:
+        lines.append(f"  !! 资源目录不存在：{ASSETS_DIR}")
+
+    # ---- Qt ----
+    try:
+        from PyQt6.QtCore import QT_VERSION_STR
+
+        lines.append("")
+        lines.append(f"Qt 版本       : {QT_VERSION_STR}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"Qt 版本       : 读取失败 —— {exc}")
+
+    report = "\n".join(lines)
+
+    # 窗口程序没有控制台，print 到不了任何地方，所以同时写文件
+    try:
+        ensure_dirs()
+        (DATA_DIR / "selftest.txt").write_text(report, encoding="utf-8")
+    except OSError:
+        pass
+
+    print(report)
+    return 0
+
+
 def main() -> int:
+    # 自检要在建 QApplication 之前处理，也不需要图形界面
+    if "--selftest" in sys.argv:
+        return run_selftest()
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+
+    # 首次运行就把数据目录建出来，用户才能通过「工具 → 打开数据目录」找到它。
+    # 等到真要写东西时才建的话，用户在此之前根本看不到这个目录。
+    ensure_dirs()
 
     # 主题必须在建窗口之前应用：各面板在构造时就会读取颜色值，
     # 晚一步的话窗口里会混着两套配色
