@@ -9,6 +9,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field, asdict
 
+from core.doom import DoomState
+
 #: 稀有度取值，由低到高。AI 生成结果会按这个集合做归一下
 RARITY_LEVELS = ["普通", "精良", "稀有", "史诗", "传说"]
 
@@ -53,16 +55,31 @@ class WorldState:
     time: str = "未知"
     #: [{ "name": "北境王庭", "relation": "敌对" }, ...]
     factions: list[dict] = field(default_factory=list)
-    #: 由玩家行为累积出来的自由描述标签，阶段 9 会写入
+    #: 由玩家行为累积出来的自由描述标签
     flags: list[str] = field(default_factory=list)
+    #: 毁灭进度。「禁止随机触发世界毁灭」这条约束就挂在这上面
+    doom: DoomState = field(default_factory=DoomState)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "WorldState":
-        allowed = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+        if not isinstance(data, dict):
+            return cls()
+
+        allowed = set(cls.__dataclass_fields__) - {"doom"}
+        state = cls(**{k: v for k, v in data.items() if k in allowed})
+
+        # doom 是嵌套对象，不能用通用的字段过滤构造
+        state.doom = DoomState.from_dict(data.get("doom"))
+
+        # 容器类型兜底，避免旧存档或手改过的档把界面渲染炸了
+        if not isinstance(state.factions, list):
+            state.factions = []
+        if not isinstance(state.flags, list):
+            state.flags = []
+        return state
 
 
 #: 势力关系 → 显示颜色，世界状态面板用

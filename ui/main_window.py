@@ -32,6 +32,8 @@ from ui import styles
 from ui.action_panel import ActionPanel
 from ui.inventory_panel import InventoryPanel
 from ui.item_gen_dialog import ItemGenDialog
+from ui.event_dialog import EventDialog
+from ui.item_gen_dialog import ItemGenDialog
 from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
@@ -154,6 +156,13 @@ class MainWindow(QMainWindow):
         self.act_gen_items.setStatusTip("让 AI 依据世界观现场生成道具")
         self.act_gen_items.triggered.connect(self._on_generate_items)
         tools_menu.addAction(self.act_gen_items)
+
+        self.act_gen_event = QAction("生成事件…", self)
+        self.act_gen_event.setStatusTip(
+            "让 AI 结算一次玩家操作，生成事件、NPC 与行动选项"
+        )
+        self.act_gen_event.triggered.connect(self._on_generate_event)
+        tools_menu.addAction(self.act_gen_event)
 
         # ---------- 帮助 ----------
         help_menu = bar.addMenu("帮助")
@@ -335,6 +344,41 @@ class MainWindow(QMainWindow):
 
         # 使用道具同样计入历史，后续 AI 生成时能看到
         self._history.record(f"使用了道具「{item.name}」")
+
+    def _on_generate_event(self) -> None:
+        if self._world is None:
+            QMessageBox.information(
+                self,
+                "尚未导入世界观",
+                "事件必须依据世界观生成，请先在「游戏 → 世界观文档」中导入一份。",
+            )
+            return
+
+        if not self._config.has_api_key:
+            QMessageBox.warning(
+                self,
+                "尚未配置 API Key",
+                "生成事件需要调用 DeepSeek 接口，请先在「设置 → API 设置」中填入 Key。",
+            )
+            return
+
+        dialog = EventDialog(
+            self._config,
+            self._world,
+            player=self._player,
+            state=self._world_state,
+            inventory=self.inventory_panel.items(),
+            history=self._history,
+            tracker=self._usage,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_usage_label()
+
+        # 对话框里直接把变更应用到了 _world_state / _player 上，这里只需刷新界面
+        self.world_panel.update_world(self._world_state)
+        self.world_panel.update_player(self._player)
+        self._refresh_status()
 
     def _on_generate_items(self) -> None:
         if self._world is None:

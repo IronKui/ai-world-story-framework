@@ -852,6 +852,259 @@ def test_items() -> None:
 
 
 # ----------------------------------------------------------------------
+# 阶段 8：事件生成与毁灭约束
+# ----------------------------------------------------------------------
+
+
+def test_doom() -> None:
+    from core.doom import (
+        DOOM_MAX,
+        MAX_DELTA_PER_TURN,
+        DoomState,
+        ceiling_for,
+        level_name,
+    )
+
+    # 每个等级都要有明确的描写上限，含糊的约束模型不会遵守
+    for level in range(DOOM_MAX + 1):
+        check(f"阶段8 等级 {level} 有说明", bool(level_name(level)))
+        check(f"阶段8 等级 {level} 有描写上限", len(ceiling_for(level)) > 20)
+
+    doom = DoomState()
+    check("阶段8 初始为 0 级", doom.level == 0 and not doom.evidence)
+    check("阶段8 0 级禁止世界级威胁", "禁止" in doom.ceiling)
+
+    # 有理由的推进被接受
+    applied, note = doom.advance(1, "玩家执意开启了封存的门")
+    check("阶段8 有理由的推进被接受", applied == 1 and doom.level == 1)
+    check("阶段8 推进留下履历", len(doom.evidence) == 1 and "封存的门" in doom.evidence[0])
+
+    # 无理由的推进必须被丢弃 —— 这是防止模型乱推的关键
+    applied, note = doom.advance(1, "")
+    check("阶段8 无理由的推进被丢弃", applied == 0 and doom.level == 1)
+    check("阶段8 丢弃时给出说明", "没有给出理由" in note)
+
+    applied, _ = doom.advance(1, "   ")
+    check("阶段8 纯空白理由也被丢弃", applied == 0 and doom.level == 1)
+
+    # 单回合增量封顶
+    applied, _ = doom.advance(99, "一次性推满")
+    check(
+        f"阶段8 单回合增量封顶 {MAX_DELTA_PER_TURN}",
+        applied == MAX_DELTA_PER_TURN and doom.level == 2,
+    )
+
+    # 推进到满级后不再累加
+    while doom.level < DOOM_MAX:
+        doom.advance(1, f"第 {doom.level} 次重大选择")
+    check("阶段8 可达满级", doom.level == DOOM_MAX and doom.at_max)
+
+    applied, note = doom.advance(1, "再来一次")
+    check("阶段8 满级后不再累积", applied == 0 and "已满" in note)
+    check("阶段8 满级后履历不再增长", len(doom.evidence) == DOOM_MAX)
+
+    # 0 到满级至少需要 DOOM_MAX 次独立的有理由推进
+    fresh = DoomState()
+    turns = 0
+    while not fresh.at_max and turns < 100:
+        fresh.advance(1, f"选择 {turns}")
+        turns += 1
+    check("阶段8 满级所需的铺垫回合数", turns == DOOM_MAX, f"用了 {turns} 回合")
+
+    # 序列化
+    restored = DoomState.from_dict(doom.to_dict())
+    check(
+        "阶段8 进度往返",
+        restored.level == doom.level and restored.evidence == doom.evidence,
+    )
+    check("阶段8 残缺数据兜底", DoomState.from_dict({}).level == 0)
+    check("阶段8 越界数据被夹紧", DoomState.from_dict({"level": 999}).level == DOOM_MAX)
+
+    # 提示词里必须写清上限和履历
+    text = doom.describe()
+    check("阶段8 描述含进度", f"{DOOM_MAX}/{DOOM_MAX}" in text)
+    check("阶段8 描述含描写上限", "描写上限" in text)
+    check("阶段8 描述含履历", "重大选择" in text)
+
+
+def test_events() -> None:
+    from core.doom import DOOM_MAX, DoomState
+    from core.events import (
+        StateChanges,
+        apply_state_changes,
+        doom_validation_rule,
+        parse_event,
+    )
+    from core.models import WorldState
+    from core.savegame import PlayerState
+
+    good = (
+        '{"narrative":"巷道尽头的铁门半开着。",'
+        '"npc":"阿蘅","npc_dialog":"别往里走。",'
+        '"options":["进去看看","退回去"],'
+        '"doom_delta":0,"doom_reason":"",'
+        '"state_changes":{"location":"仓库夹层","add_flags":["见过阿蘅"]}}'
+    )
+    event, error = parse_event(good)
+    check(
+        "阶段8 解析事件",
+        error == "" and event is not None and event.narrative == "巷道尽头的铁门半开着。"
+        and event.npc == "阿蘅" and len(event.options) == 2,
+    )
+    check("阶段8 解析状态变更", event.changes.location == "仓库夹层")
+    check("阶段8 解析印记", event.changes.add_flags == ["见过阿蘅"])
+
+    for label, raw in [
+        ("缺 narrative", '{"options":["a","b"]}'),
+        ("选项不足", '{"narrative":"x","options":["只有一个"]}'),
+        ("非 json", "这个世界完了"),
+        ("空", ""),
+    ]:
+        parsed, err = parse_event(raw)
+        check(f"阶段8 拒绝 {label}", parsed is None and err != "")
+
+    # 关系值不在白名单里要过滤掉，否则界面拿到无法着色的值
+    bad_relation = (
+        '{"narrative":"x","options":["a","b"],"state_changes":'
+        '{"faction_changes":[{"name":"码头帮","relation":"很生气"},'
+        '{"name":"王庭","relation":"敌对"}]}}'
+    )
+    parsed, _ = parse_event(bad_relation)
+    check(
+        "阶段8 非法势力关系被过滤",
+        len(parsed.changes.faction_changes) == 1
+        and parsed.changes.faction_changes[0]["name"] == "王庭",
+    )
+
+    # 正文保留段落，选项压缩空白
+    multiline = (
+        '{"narrative":"第一段。\\n\\n第二段。","options":["选项\\n  带换行  ","b"]}'
+    )
+    parsed, _ = parse_event(multiline)
+    check("阶段8 正文保留换行", "\n" in parsed.narrative)
+    check("阶段8 选项压缩空白", parsed.options[0] == "选项 带换行")
+
+    # ---------- 状态应用 ----------
+    state = WorldState(location="灰烬港", factions=[{"name": "码头帮", "relation": "中立"}])
+    player = PlayerState(name="凌昭", status=["轻度灰化"])
+
+    changes = StateChanges(
+        location="仓库夹层",
+        time="灰烬三十七年·冬",
+        faction_changes=[
+            {"name": "码头帮", "relation": "敌对"},
+            {"name": "拾灰人", "relation": "友好"},
+        ],
+        add_flags=["见过阿蘅"],
+        player_status_add=["左臂灼伤"],
+        player_status_remove=["轻度灰化"],
+        player_notes="被码头帮盯上了",
+    )
+    notes = apply_state_changes(changes, state, player)
+
+    check("阶段8 位置已更新", state.location == "仓库夹层")
+    check("阶段8 时间已更新", state.time == "灰烬三十七年·冬")
+    check(
+        "阶段8 势力关系更新而非重复追加",
+        len(state.factions) == 2
+        and next(f for f in state.factions if f["name"] == "码头帮")["relation"] == "敌对",
+    )
+    check("阶段8 新势力被追加", any(f["name"] == "拾灰人" for f in state.factions))
+    check("阶段8 印记已加", "见过阿蘅" in state.flags)
+    check("阶段8 状态增删", "左臂灼伤" in player.status and "轻度灰化" not in player.status)
+    check("阶段8 处境已更新", player.notes == "被码头帮盯上了")
+    check("阶段8 返回变更说明", len(notes) >= 5)
+
+    # 重复印记不该重复追加
+    apply_state_changes(StateChanges(add_flags=["见过阿蘅"]), state)
+    check("阶段8 印记去重", state.flags.count("见过阿蘅") == 1)
+
+    # 印记与状态数量要有上限，否则长局会无限膨胀进 prompt
+    for i in range(40):
+        apply_state_changes(StateChanges(add_flags=[f"印记{i}"]), state)
+    check("阶段8 印记数量有上限", len(state.flags) <= 20, str(len(state.flags)))
+
+    for i in range(30):
+        apply_state_changes(StateChanges(player_status_add=[f"状态{i}"]), state, player)
+    check("阶段8 玩家状态有上限", len(player.status) <= 10, str(len(player.status)))
+
+    # ---------- 毁灭校验规则 ----------
+    for level in (0, 2, DOOM_MAX):
+        rule = doom_validation_rule(level)
+        check(f"阶段8 毁灭规则含进度 {level}", f"{level}/{DOOM_MAX}" in rule)
+    check("阶段8 0 级规则最严", "任何世界级威胁" in doom_validation_rule(0))
+    check("阶段8 满级规则放开", "允许" in doom_validation_rule(DOOM_MAX))
+
+    # ---------- 生成循环中的毁灭裁定 ----------
+    class _FakeEventClient:
+        def __init__(self, generation, verdicts):
+            self._generation = list(generation)
+            self._verdicts = list(verdicts)
+            self.validate_prompts = []
+
+        def stream_chat(self, messages, **kwargs):
+            from core.api_client import ChatResult
+
+            if messages[0]["content"].startswith("你是一个文字游戏的实时事件生成器"):
+                return ChatResult(content=self._generation.pop(0), model="fake", usage={})
+            self.validate_prompts.append(messages[-1]["content"])
+            return ChatResult(content=self._verdicts.pop(0), model="fake", usage={})
+
+    from core.events import generate_event
+    from core.world import WorldDocument
+
+    world = WorldDocument(name="测试", text="初火山在冰墙之外。")
+    ok_verdict = '{"conflict": false}'
+
+    # AI 提议推进但没给理由 → 框架驳回
+    no_reason = (
+        '{"narrative":"天地开始崩塌。","options":["逃","留"],'
+        '"doom_delta":1,"doom_reason":""}'
+    )
+    client = _FakeEventClient([no_reason], [ok_verdict])
+    state = WorldState(doom=DoomState())
+    result = generate_event(client, world, "我走向初火山", state=state, max_retries=3)
+    check(
+        "阶段8 无理由的毁灭推进被框架驳回",
+        result.applied_doom_delta == 0 and state.doom.level == 0 and result.doom_rejected,
+    )
+
+    # AI 提议且给了理由 → 接受
+    with_reason = (
+        '{"narrative":"封印松动了。","options":["继续","停手"],'
+        '"doom_delta":1,"doom_reason":"玩家执意取走了初火之源"}'
+    )
+    client = _FakeEventClient([with_reason], [ok_verdict])
+    state = WorldState(doom=DoomState())
+    result = generate_event(client, world, "我取走初火之源", state=state, max_retries=3)
+    check(
+        "阶段8 有理由的推进被接受",
+        result.applied_doom_delta == 1 and state.doom.level == 1
+        and len(state.doom.evidence) == 1,
+    )
+
+    # 即使 AI 一次推满，也会被压到单回合上限
+    huge = (
+        '{"narrative":"世界毁灭了。","options":["a","b"],'
+        '"doom_delta":5,"doom_reason":"一口气推满"}'
+    )
+    client = _FakeEventClient([huge], [ok_verdict])
+    state = WorldState(doom=DoomState())
+    result = generate_event(client, world, "x", state=state, max_retries=3)
+    check(
+        "阶段8 AI 一次推满会被压到单回合上限",
+        state.doom.level == 1,
+    )
+
+    # 校验请求里必须带上毁灭规则
+    check(
+        "阶段8 校验请求含毁灭约束",
+        "毁灭约束" in client.validate_prompts[0]
+        and "描写上限" in client.validate_prompts[0],
+    )
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -881,6 +1134,8 @@ def main() -> int:
         test_usage(tmp)
         test_validator()
         test_items()
+        test_doom()
+        test_events()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

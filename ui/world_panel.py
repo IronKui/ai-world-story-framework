@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.doom import DOOM_MAX
 from core.models import WorldState, relation_color
 from core.savegame import PlayerState
 from ui import styles
@@ -61,6 +62,11 @@ class WorldPanel(Panel):
         form.addRow(self._make_key_label("世界时间"), self.time_value)
         self.body.addLayout(form)
 
+        # ---------- 毁灭进度 ----------
+        self.doom_label = QLabel()
+        self.doom_label.setWordWrap(True)
+        self.body.addWidget(self.doom_label)
+
         # ---------- 势力关系 ----------
         factions_header = QLabel("势力关系")
         factions_header.setObjectName("PanelHint")
@@ -93,6 +99,7 @@ class WorldPanel(Panel):
         """整体刷新世界状态。"""
         self.location_value.setText(state.location or "未知")
         self.time_value.setText(state.time or "未知")
+        self._render_doom(state.doom)
         self._render_factions(state.factions)
         self._render_flags(state.flags)
 
@@ -152,6 +159,28 @@ class WorldPanel(Panel):
             item.setForeground(QColor(relation_color(relation)))
             item.setToolTip(faction.get("note", "") or f"{name}（{relation}）")
             self.faction_list.addItem(item)
+
+    def _render_doom(self, doom) -> None:
+        """毁灭进度。平静时弱化显示，有进度后转为警示色。"""
+        c = styles.COLORS
+        if doom.level <= 0:
+            self.doom_label.setText(
+                f'<span style="color:{c["text_faint"]};">毁灭进度　'
+                f"{doom.progress_text()}</span>"
+            )
+        else:
+            bar = "■" * doom.level + "□" * (DOOM_MAX - doom.level)
+            self.doom_label.setText(
+                f'<span style="color:{c["text_faint"]};">毁灭进度</span>　'
+                f'<span style="color:{c["danger"]};font-weight:600;">{bar}</span>'
+                f'<span style="color:{c["text_dim"]};">　{doom.name}</span>'
+            )
+        self.doom_label.setTextFormat(Qt.TextFormat.RichText)
+        self.doom_label.setToolTip(
+            doom.ceiling
+            + ("\n\n推动毁灭的选择：\n" + "\n".join(f"· {e}" for e in doom.evidence)
+               if doom.evidence else "")
+        )
 
     def _render_flags(self, flags: list[str]) -> None:
         if flags:

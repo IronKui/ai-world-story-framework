@@ -197,13 +197,22 @@ VALIDATE_SYSTEM = """你是一个世界观一致性校验器。你的唯一职�
 
 
 def build_validate_prompt(
-    world: WorldDocument | None, content: str, kind: str = "内容"
+    world: WorldDocument | None,
+    content: str,
+    kind: str = "内容",
+    extra_rules: str = "",
 ) -> str:
-    """组装校验请求。"""
-    return (
-        f"{world_block(world)}\n\n"
-        f"【待校验内容（类型：{kind}）】\n{content}"
-    )
+    """组装校验请求。
+
+    extra_rules 用于叠加与本内容类型相关的额外硬性规则，
+    例如阶段 8 的毁灭约束 —— 那条规则是玩法层面的限制，
+    跟「是否违背世界观设定」不是一回事，但同样要拦。
+    """
+    blocks = [world_block(world)]
+    if extra_rules.strip():
+        blocks.append(extra_rules.strip())
+    blocks.append(f"【待校验内容（类型：{kind}）】\n{content}")
+    return "\n\n".join(blocks)
 
 
 def parse_verdict(raw: str) -> ValidationVerdict:
@@ -288,6 +297,7 @@ def validate_content(
     content: str,
     *,
     kind: str = "内容",
+    extra_rules: str = "",
     on_delta: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> tuple[ValidationVerdict, ChatResult | None]:
@@ -299,7 +309,7 @@ def validate_content(
     if not (content or "").strip():
         return ValidationVerdict(passed=True, error="待校验内容为空"), None
 
-    prompt = build_validate_prompt(world, content, kind)
+    prompt = build_validate_prompt(world, content, kind, extra_rules)
 
     try:
         result = client.stream_chat(
@@ -345,6 +355,7 @@ def guarded_generate(
     generate: Callable[[list[str]], str],
     parse: Callable[[str], tuple[object, str]] | None = None,
     render_for_validation: Callable[[object], str] | None = None,
+    extra_rules: str = "",
     kind: str = "内容",
     max_retries: int = DEFAULT_MAX_RETRIES,
     on_progress: Callable[[str], None] | None = None,
@@ -426,7 +437,12 @@ def guarded_generate(
 
         report(f"第 {index}/{max_retries} 次校验中…" if index > 1 else "校验中…")
         verdict, check_result = validate_content(
-            client, world, check_text, kind=kind, should_stop=should_stop
+            client,
+            world,
+            check_text,
+            kind=kind,
+            extra_rules=extra_rules,
+            should_stop=should_stop,
         )
 
         # 校验也是一次真实的 API 调用，同样计入用量

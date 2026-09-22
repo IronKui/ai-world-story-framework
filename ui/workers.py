@@ -12,6 +12,7 @@ import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.api_client import ApiError, ChatResult, DeepSeekClient, TestResult
+from core.events import generate_event
 from core.items import ItemRequest, generate_items
 from core.models import Item, WorldState
 from core.prompts import JSON_REQUIREMENT, retry_note
@@ -364,6 +365,85 @@ class ItemGenThread(QThread):
             self.failed.emit(
                 ApiError(
                     f"生成道具时出现未预期的错误：{type(exc).__name__}: {exc}",
+                    kind="unknown",
+                    detail=repr(exc),
+                )
+            )
+            return
+
+        self.done.emit(result)
+
+
+class EventThread(QThread):
+    """AI 事件生成线程（阶段 8）。
+
+    毁灭增量由框架在 generate_event 内部复核，不在这里处理 ——
+    AI 只是提议，是否真的推进由 DoomState.advance 决定。
+    """
+
+    progress = pyqtSignal(str)
+    attempt_done = pyqtSignal(object)
+    #: 完成，携带 EventGenerationResult
+    done = pyqtSignal(object)
+    #: 失败，携带 ValidationExhausted 或 ApiError
+    failed = pyqtSignal(object)
+    #: (model, usage_dict, reason)
+    usage_ready = pyqtSignal(str, object, str)
+
+    def __init__(
+        self,
+        client: DeepSeekClient,
+        world: WorldDocument | None,
+        action: str,
+        *,
+        player: PlayerState | None = None,
+        state: WorldState | None = None,
+        inventory: list | None = None,
+        history: HistoryLog | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._client = client
+        self._world = world
+        self._action = action
+        self._player = player
+        self._state = state
+        self._inventory = inventory
+        self._history = history
+        self._max_retries = max_retries
+
+        self._stop = threading.Event()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            result = generate_event(
+                self._client,
+                self._world,
+                self._action,
+                player=self._player,
+                state=self._state,
+                inventory=self._inventory,
+                history=self._history,
+                max_retries=self._max_retries,
+                on_progress=self.progress.emit,
+                on_attempt=self.attempt_done.emit,
+                on_usage=lambda model, usage, reason: self.usage_ready.emit(
+                    model, usage, reason
+                ),
+                should_stop=lambda: self._stop.is_set(),
+            )
+        except ValidationExhausted as exc:
+            self.failed.emit(exc)
+        except ApiError as exc:
+            self.failed.emit(exc)
+        except BaseException as exc:  # noqa: BLE001
+            self.failed.emit(
+                ApiError(
+                    f"生成事件时出现未预期的错误：{type(exc).__name__}: {exc}",
                     kind="unknown",
                     detail=repr(exc),
                 )
