@@ -1417,6 +1417,40 @@ def test_theme_switching() -> None:
     styles.set_theme(original)
 
 
+def test_no_hardcoded_colors() -> None:
+    """QSS 模板里不能有写死的颜色。
+
+    这条是有来历的：滚动条、危险按钮边框、复选框指示器当初都写死了十六进制色，
+    结果切主题时那几处的颜色纹丝不动 —— 滚动条在琥珀主题下还是蓝灰色。
+    颜色必须全部走 $变量，由调色板提供。
+
+    （派生色如 danger_soft 是在 stylesheet() 里按主题算出来的 rgba，
+      不在模板里，所以不会误判。）
+    """
+    import re
+
+    from ui import styles
+
+    template = styles._QSS.template
+    hardcoded = re.findall(r"#[0-9a-fA-F]{3,8}\b", template)
+
+    check("QSS 无写死颜色", not hardcoded, "写死的是: " + ", ".join(sorted(set(hardcoded))))
+
+    # 势力关系颜色也必须跟随主题
+    styles.set_theme("deep_blue")
+    blue = styles.relation_color("敌对")
+    styles.set_theme("amber")
+    amber = styles.relation_color("敌对")
+    check("势力关系颜色跟随主题", blue != amber, f"{blue} vs {amber}")
+
+    check(
+        "未知势力关系有兜底",
+        styles.relation_color("不存在的关系") == styles.COLORS["r_common"],
+    )
+
+    styles.set_theme("deep_blue")
+
+
 def test_background() -> None:
     from ui import styles
 
@@ -1436,7 +1470,16 @@ def test_background() -> None:
     styles.set_background(None)
     plain = styles.stylesheet()
     check("无背景图时窗口底色不透明", "QWidget#Root { background: #" in plain)
-    check("无背景图时不出现 rgba", "rgba(" not in plain)
+    # 没有背景图时，面板底色必须是不透明 hex。
+    # （派生色如 danger_soft 本来就是 rgba，这里只查面板层）
+    check(
+        "无背景图时面板底色不透明",
+        f"QFrame#Panel {{\n    background: {styles.COLORS['bg_panel']};" in plain,
+    )
+    check(
+        "无背景图时阅读区底色不透明",
+        f"QTextBrowser#StoryView {{\n    background: {styles.COLORS['bg_input']};" in plain,
+    )
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
         # 写一个最小的合法 PNG 头就够了 —— styles 只检查文件是否存在
@@ -1697,6 +1740,85 @@ def test_assets() -> None:
 
 
 # ----------------------------------------------------------------------
+# 流式 JSON 字段提取
+# ----------------------------------------------------------------------
+
+
+def test_jsonstream() -> None:
+    """从流式 JSON 里增量提取字段值。
+
+    事件生成是 JSON 输出，直接显示原始分片会看到 {"narrative": "… 这种噪音。
+    这个提取器负责只把正文抠出来。
+    """
+    from core.jsonstream import JsonFieldStream
+
+    def extract(chunks: list[str], field: str = "narrative") -> tuple[str, bool]:
+        stream = JsonFieldStream(field)
+        text = "".join(stream.feed(chunk) for chunk in chunks)
+        return text, stream.finished
+
+    # 完整 JSON：raw 字符串里 \n 是两个字符（反斜杠 + n），符合 JSON 规范
+    full = '{"narrative": "铁索阶梯向下延伸。\\n\\n他停住了。", "options": ["a","b"]}'
+    expected = "铁索阶梯向下延伸。\n\n他停住了。"
+
+    text, done = extract([full])
+    check("流式 一次给完", text == expected and done)
+
+    # 任意切分都不能出错 —— 网络分片位置是随机的
+    for size in (1, 3, 7, 13, 50):
+        chunks = [full[i : i + size] for i in range(0, len(full), size)]
+        text, done = extract(chunks)
+        check(f"流式 按 {size} 字符分片", text == expected and done, repr(text[:30]))
+
+    # 转义序列被拆开是真实会发生的情况
+    text, done = extract(['{"narrative": "abc\\', 'ndef"}'])
+    check("流式 转义被拆开也正确", text == "abc\ndef" and done, repr(text))
+
+    text, done = extract(['{"narrative": "\\u4e', '2d\\u6587"}'])
+    check("流式 unicode 转义被拆开", text == "中" + "文" and done, repr(text))
+
+    # 末尾半个转义不能急着输出，否则界面会闪过一个孤零零的反斜杠
+    stream = JsonFieldStream("narrative")
+    first = stream.feed('{"narrative": "abc\\')
+    check("流式 半个转义不输出", first == "abc", repr(first))
+    second = stream.feed('ndef"}')
+    check("流式 补齐后输出余下部分", second == "\ndef", repr(second))
+
+    # 各种非字符串值不该崩，也不该吐出垃圾
+    for label, payload in [
+        ("字段不存在", '{"other": "值"}'),
+        ("值是对象", '{"narrative": {"a": 1}}'),
+        ("值是数字", '{"narrative": 123}'),
+        ("值是数组", '{"narrative": ["x"]}'),
+    ]:
+        text, _ = extract([payload])
+        check(f"流式 忽略{label}", text == "", repr(text))
+
+    text, done = extract(['{"narrative": ""}'])
+    check("流式 空值", text == "" and done)
+
+    # 引号转义
+    text, done = extract(['{"narrative": "他说\\"好\\"就走了"}'])
+    check("流式 引号转义", text == '他说"好"就走了' and done, repr(text))
+
+    # 未知转义原样保留，不要吞字符
+    text, _ = extract(['{"narrative": "a\\\'b"}'])
+    check("流式 未知转义不吞字符", "a" in text and "b" in text, repr(text))
+
+    # 提取别的字段
+    text, done = extract(['{"npc": "阿桑", "narrative": "x"}'], field="npc")
+    check("流式 可提取任意字段", text == "阿桑" and done, repr(text))
+
+    # 属性：中途可以拿到已提取的文本
+    stream = JsonFieldStream("narrative")
+    stream.feed('{"narrative": "前半')
+    check("流式 中途可读已提取内容", stream.text == "前半")
+    check("流式 中途未完成", not stream.finished)
+    stream.feed('后半"}')
+    check("流式 结束后内容完整", stream.text == "前半后半" and stream.finished)
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -1733,9 +1855,11 @@ def main() -> int:
         test_excepthook_installed()
         test_themes()
         test_theme_switching()
+        test_no_hardcoded_colors()
         test_background()
         test_worldgen()
         test_assets()
+        test_jsonstream()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

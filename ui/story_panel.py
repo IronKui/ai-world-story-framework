@@ -3,6 +3,7 @@
 阶段 1 只负责显示，内容来源由外部调用 append_* 方法注入。
 """
 
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QTextBrowser, QWidget
 
 from ui import styles
@@ -22,6 +23,9 @@ class StoryPanel(Panel):
         # 不要自动加载远程资源，纯本地渲染
         self.view.setOpenLinks(False)
         self.body.addWidget(self.view, 1)
+
+        #: 流式写入的起点位置，None 表示当前不在流式状态
+        self._stream_start: int | None = None
 
         self.clear()
 
@@ -67,6 +71,49 @@ class StoryPanel(Panel):
         """直接追加一段已渲染好的 HTML，阶段 7/8 生成结构化内容时用。"""
         self.view.append(html)
         self._scroll_to_bottom()
+
+    # ---------- 流式写入 ----------
+    #
+    # 生成过程中先把正文逐字打到界面上，让玩家看到在写什么；
+    # 生成结束后把这块临时文本抹掉，换成正式排版
+    # （一句话一段、段间留白）。
+    #
+    # 不直接按正式格式边写边排，是因为流式分片会切在段落中间，
+    # 那样每来一个字都要重排整段，既卡又闪。
+
+    def begin_stream(self) -> None:
+        """标记流式区域的起点。"""
+        cursor = self.view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._stream_start = cursor.position()
+
+    def stream_text(self, piece: str) -> None:
+        """往流式区域追加文本。"""
+        if not piece:
+            return
+
+        cursor = self.view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(piece)
+        self.view.setTextCursor(cursor)
+        self._scroll_to_bottom()
+
+    def end_stream(self) -> None:
+        """抹掉流式期间的临时文本，为正式排版让位。"""
+        if self._stream_start is None:
+            return
+
+        cursor = self.view.textCursor()
+        cursor.setPosition(self._stream_start)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor
+        )
+        cursor.removeSelectedText()
+        self._stream_start = None
+
+    @property
+    def is_streaming(self) -> bool:
+        return self._stream_start is not None
 
     # ---------- 内部实现 ----------
 

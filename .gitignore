@@ -13,11 +13,14 @@ __pycache__/
 data/config.json
 data/config.*.json
 
-# 存档 / 世界观副本 / 调试日志
+# 存档 / 世界观副本 / 调试日志 / 用量统计
 data/saves/
 data/worlds/
 data/logs/
 *.log
+
+# 用量与花费统计（属于本机使用数据，不该随代码走）
+data/usage.json
 
 # ---------- 编辑器 / 系统 ----------
 .vscode/

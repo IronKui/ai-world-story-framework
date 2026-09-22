@@ -1,9 +1,10 @@
 """外观设置：配色方案与自定义背景图。
 
-主题在启动时应用、改完需要重启。原因是代码里有 80 多处直接在构造时
-读取颜色值，要做到即时生效得把那批内联样式全部改写成 QSS 选择器 ——
-那是一次独立重构，不适合塞进这一版。用户改主题的频率很低，
-「重启后生效」是可接受的代价。
+改动**即时生效**，不重启程序。
+
+早先的做法是提示用户重启，结果切个配色就把没存档的进度弄丢了 ——
+这对游戏来说不可接受。现在改成由主窗口就地重建面板
+（见 MainWindow._apply_theme_live），剧情、背包、状态全部保留。
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ class AppearanceDialog(QDialog):
         self._config = config
         self._theme_key = config.theme if config.theme in themes.THEMES else themes.DEFAULT_THEME
         self._background = config.background_image
-        #: 是否有实际改动，决定要不要提示重启
+        #: 是否有实际改动，决定要不要即时换肤
         self.changed = False
 
         self._build_ui()
@@ -128,7 +129,7 @@ class AppearanceDialog(QDialog):
 
         note = QLabel(
             "背景图会被压暗后铺在界面底层，面板保持半透明以便看清文字。"
-            "主题与背景的改动需要重启程序后生效。"
+            "保存后立即生效，游戏进度不会丢失。"
         )
         note.setWordWrap(True)
         note.setStyleSheet(

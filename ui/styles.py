@@ -94,6 +94,25 @@ def rarity_color(rarity: str) -> str:
     return COLORS.get(key, COLORS["r_common"])
 
 
+#: 势力关系 → 调色板键。
+#: 这些颜色属于外观，必须跟随主题 —— 早先它们写死在 core/models.py 里，
+#: 结果切主题时势力关系那一栏颜色纹丝不动。
+RELATION_KEYS = {
+    "盟友": "success",
+    "友好": "r_good",
+    "中立": "r_common",
+    "疏远": "warning",
+    "敌对": "danger",
+    "死敌": "danger_hover",
+}
+
+
+def relation_color(relation: str) -> str:
+    """取势力关系对应的颜色，未知关系按中立处理。"""
+    key = RELATION_KEYS.get(relation, "r_common")
+    return COLORS.get(key, COLORS["text_dim"])
+
+
 _QSS = Template(
     """
 * {
@@ -203,14 +222,14 @@ QPushButton:disabled { color: $text_faint; border-color: $border_soft; backgroun
 QPushButton#PrimaryButton {
     background: $accent;
     border: 1px solid $accent;
-    color: #0f1117;
+    color: $bg_window;   /* 主色上的文字，用最深的底色保证对比 */
     font-weight: 600;
 }
 QPushButton#PrimaryButton:hover { background: $accent_hover; border-color: $accent_hover; }
 QPushButton#PrimaryButton:disabled { background: $accent_dim; border-color: $accent_dim; color: $text_dim; }
 
-QPushButton#DangerButton { color: $danger; border-color: #4a2a32; }
-QPushButton#DangerButton:hover { background: #2a1c22; border-color: $danger; }
+QPushButton#DangerButton { color: $danger; border-color: $danger_soft; }
+QPushButton#DangerButton:hover { background: $danger_bg; border-color: $danger; }
 
 /* ---------- 输入控件 ---------- */
 /* 注意：QDoubleSpinBox 不是 QSpinBox 的子类，
@@ -280,7 +299,7 @@ QScrollBar:vertical {
     margin: 2px;
 }
 QScrollBar::handle:vertical {
-    background: #333a4e;
+    background: $bg_hover;
     border-radius: 5px;
     min-height: 30px;
 }
@@ -291,7 +310,7 @@ QScrollBar:horizontal {
     margin: 2px;
 }
 QScrollBar::handle:horizontal {
-    background: #333a4e;
+    background: $bg_hover;
     border-radius: 5px;
     min-width: 30px;
 }
@@ -345,7 +364,7 @@ QCheckBox { spacing: 8px; }
 /* 未勾选态必须比 $border 明显亮，否则在深色面板上等于隐形 */
 QCheckBox::indicator {
     width: 16px; height: 16px;
-    border: 1px solid #6e7891;
+    border: 1px solid $text_faint;
     border-radius: 4px;
     background: $bg_elev;
 }
@@ -371,6 +390,10 @@ def stylesheet() -> str:
     # 根容器：没有背景图时就是普通窗口底色；
     # 有背景图时必须透空，交给 Backdrop 组件去画图
     colors["bg_root"] = "transparent" if _background_image else colors["bg_window"]
+
+    # 危险色的柔和变体。各主题的危险色不同，写死一个暗红会在别的主题里突兀
+    colors["danger_soft"] = _with_alpha(colors["danger"], 90)
+    colors["danger_bg"] = _with_alpha(colors["danger"], 30)
 
     if _background_image:
         # 各层底色改成半透明，否则面板会把背景图盖得严严实实

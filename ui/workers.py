@@ -15,6 +15,7 @@ from core.api_client import ApiError, ChatResult, DeepSeekClient, TestResult
 from core.events import generate_event
 from core.game import run_turn
 from core.items import ItemRequest, generate_items
+from core.jsonstream import JsonFieldStream
 from core.models import Item, WorldState
 from core.prompts import JSON_REQUIREMENT, retry_note
 from core.savegame import HistoryLog, PlayerState
@@ -384,6 +385,8 @@ class TurnThread(QThread):
     """
 
     progress = pyqtSignal(str)
+    #: 正文流式片段 —— 边生成边显示
+    delta = pyqtSignal(str)
     #: 携带 TurnResult
     done = pyqtSignal(object)
     #: 携带 ValidationExhausted / ApiError
@@ -422,6 +425,15 @@ class TurnThread(QThread):
         self._stop.set()
 
     def run(self) -> None:  # noqa: D102
+        # 事件是 JSON 输出，直接把原始分片打到界面上会看到
+        # {"narrative": "铁索 这种噪音，所以只把 narrative 的值抠出来显示
+        extractor = JsonFieldStream("narrative")
+
+        def on_delta(piece: str) -> None:
+            visible = extractor.feed(piece)
+            if visible:
+                self.delta.emit(visible)
+
         try:
             result = run_turn(
                 self._client,
@@ -434,6 +446,7 @@ class TurnThread(QThread):
                 max_retries=self._max_retries,
                 is_opening=self._is_opening,
                 on_progress=self.progress.emit,
+                on_delta=on_delta,
                 on_usage=lambda model, usage, reason: self.usage_ready.emit(
                     model, usage, reason
                 ),

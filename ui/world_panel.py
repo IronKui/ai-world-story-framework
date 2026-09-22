@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.doom import DOOM_MAX
-from core.models import WorldState, relation_color
+from core.models import WorldState
 from core.savegame import PlayerState
 from ui import styles
 from ui.panel_base import Panel
@@ -156,7 +156,7 @@ class WorldPanel(Panel):
             relation = faction.get("relation", "中立")
 
             item = QListWidgetItem(f"{name}　·　{relation}")
-            item.setForeground(QColor(relation_color(relation)))
+            item.setForeground(QColor(styles.relation_color(relation)))
             item.setToolTip(faction.get("note", "") or f"{name}（{relation}）")
             self.faction_list.addItem(item)
 

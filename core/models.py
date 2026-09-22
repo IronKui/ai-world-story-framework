@@ -82,16 +82,5 @@ class WorldState:
         return state
 
 
-#: 势力关系 → 显示颜色，世界状态面板用
-RELATION_COLORS = {
-    "盟友": "#4fbf8b",
-    "友好": "#7fce9e",
-    "中立": "#9aa3b5",
-    "疏远": "#c9a95e",
-    "敌对": "#e05c6e",
-    "死敌": "#e05c6e",
-}
-
-
-def relation_color(relation: str) -> str:
-    return RELATION_COLORS.get(relation, "#8b94a8")
+# 势力关系的显示颜色属于外观，已移到 ui/styles.py 的 relation_color()，
+# 那样切主题时才会跟着变。

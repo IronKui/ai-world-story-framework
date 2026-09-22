@@ -478,6 +478,7 @@ def generate_event(
     on_progress: Callable[[str], None] | None = None,
     on_attempt: Callable[[GenerationAttempt], None] | None = None,
     on_usage: Callable[[str, dict, str], None] | None = None,
+    on_delta: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> EventGenerationResult:
     """生成事件。
@@ -500,6 +501,7 @@ def generate_event(
         ]
         result = client.stream_chat(
             messages,
+            on_delta=on_delta,
             should_stop=should_stop,
             json_mode=True,
             max_tokens=GENERATE_MAX_TOKENS,

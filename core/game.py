@@ -174,6 +174,7 @@ def run_turn(
     is_opening: bool = False,
     on_progress: Callable[[str], None] | None = None,
     on_usage: Callable[[str, dict, str], None] | None = None,
+    on_delta: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> TurnResult:
     """执行一个回合。
@@ -204,6 +205,7 @@ def run_turn(
         max_retries=max_retries,
         on_progress=on_progress,
         on_usage=report_usage,
+        on_delta=on_delta,
         should_stop=should_stop,
     )
     event = event_result.event

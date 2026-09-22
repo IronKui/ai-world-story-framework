@@ -12,6 +12,7 @@ import sys
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -78,6 +79,8 @@ class MainWindow(QMainWindow):
         self._turns = 0
         #: 当前正在跑的回合线程，同一时间只允许一个
         self._thread: TurnThread | None = None
+        #: 当前展示的行动选项，换肤重建面板后要还原
+        self._current_options: list[str] = []
 
         self._build_menubar()
         self._build_body()
@@ -391,6 +394,8 @@ class MainWindow(QMainWindow):
         self.action_panel.set_busy(True, "AI 正在生成内容，请稍候…")
         self.inventory_panel.set_actions_enabled(False)
         self.status_mode.setText("结算中…")
+        # 开始流式：正文会逐字打到剧情区，结束后再换成正式排版
+        self.story_panel.begin_stream()
 
         self._thread = TurnThread(
             self._make_client(),
@@ -421,6 +426,7 @@ class MainWindow(QMainWindow):
         self.action_panel.set_busy(True, "正在展开世界…")
         self.inventory_panel.set_actions_enabled(False)
         self.status_mode.setText("开场…")
+        self.story_panel.begin_stream()
 
         self._thread = TurnThread(
             self._make_client(),
@@ -435,6 +441,7 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self._thread.progress.connect(self._on_turn_progress)
+        self._thread.delta.connect(self._on_turn_delta)
         self._thread.done.connect(self._on_turn_done)
         self._thread.failed.connect(self._on_turn_failed)
         self._thread.usage_ready.connect(self._on_usage_ready)
@@ -460,6 +467,8 @@ class MainWindow(QMainWindow):
         """回合结束。渲染本身出错也必须先把界面恢复可交互状态，
         否则玩家会卡在「生成中」动不了。"""
         self._turns += 1
+        # 抹掉流式期间的临时文本，换成正式排版
+        self.story_panel.end_stream()
         try:
             self._render_turn(result)
         except Exception:  # noqa: BLE001
@@ -470,7 +479,7 @@ class MainWindow(QMainWindow):
             self._restore_after_turn()
 
         # 换上新一批行动选项
-        self.action_panel.set_options(result.event.options)
+        self._set_options(result.event.options)
         self.action_panel.focus_input()
 
     def _restore_after_turn(self) -> None:
@@ -482,6 +491,8 @@ class MainWindow(QMainWindow):
         self.status_mode.setText(f"第 {self._turns} 回合")
 
     def _on_turn_failed(self, error) -> None:
+        # 生成失败时流式区里可能留着半截文本，也要清掉
+        self.story_panel.end_stream()
         self._restore_after_turn()
         self.status_mode.setText("已中断")
 
@@ -713,39 +724,60 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "保存失败", f"无法写入配置文件：\n{exc}")
             return
 
-        if not dialog.changed:
-            return
+        if dialog.changed:
+            self._apply_theme_live()
 
-        # 主题在启动时应用，这里只能提示重启
-        answer = QMessageBox.question(
-            self,
-            "外观已保存",
-            "配色与背景的改动需要重启程序后生效。\n\n现在重启吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self._restart()
+    def _apply_theme_live(self) -> None:
+        """就地换肤，不重启程序。
 
-    def _restart(self) -> None:
-        """重启程序。
+        为什么需要重建面板：各面板在构造时就把颜色值写进了内联样式
+        （全项目 80 多处），换主题后那些地方不会自己更新。
+        重建一遍面板是最省事且不会漏的做法。
 
-        用 QProcess 启动一份全新实例再退出自己 —— 比在进程内重建界面可靠，
-        重建界面会漏掉一堆初始化顺序上的坑。
+        关键是**不能丢进度** —— 剧情内容、背包、玩家与世界状态都在
+        MainWindow 的内存里，重建前后搬运一次即可。
+        早先的版本是提示用户重启，结果切个配色就把没存档的进度弄丢了。
         """
-        import sys as _sys
+        # ---- 1. 收集要在重建后恢复的内容 ----
+        story_html = self.story_panel.view.toHtml()
+        items = self.inventory_panel.items()
+        options = self._current_options
 
-        from PyQt6.QtCore import QProcess
+        # ---- 2. 换色 ----
+        styles.set_theme(self._config.theme)
+        styles.set_background(self._config.background_image)
 
-        try:
-            QProcess.startDetached(_sys.executable, _sys.argv)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(
-                self, "重启失败", f"请手动关闭并重新打开程序。\n\n{exc}"
-            )
-            return
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(styles.stylesheet())
 
-        self.close()
+        # ---- 3. 重建面板 ----
+        old_root = self.takeCentralWidget()
+        self._build_body()
+        if old_root is not None:
+            old_root.deleteLater()
+
+        self.story_panel.apply_document_style()
+        self._apply_background()
+        self._connect_signals()
+
+        # ---- 4. 还原内容 ----
+        if story_html:
+            self.story_panel.view.setHtml(story_html)
+            self.story_panel._scroll_to_bottom()
+
+        self.inventory_panel.set_items(items)
+        self.world_panel.update_player(self._player)
+        self.world_panel.update_world(self._world_state)
+        self._set_options(options)
+
+        # 回合进行中切主题的话，保持忙碌状态不被清掉
+        if self._thread is not None and self._thread.isRunning():
+            self.action_panel.set_busy(True, "AI 正在生成内容，请稍候…")
+
+        self._refresh_status()
+        self._refresh_usage_label()
+        self.status_mode.setText("外观已更新")
 
     def _on_debug_log_toggled(self, enabled: bool) -> None:
         self._config.debug_log = enabled
@@ -942,7 +974,7 @@ class MainWindow(QMainWindow):
     def _refresh_options(self) -> None:
         """按当前就绪状态给出一批引导选项。"""
         if self._world is None:
-            self.action_panel.set_options(
+            self._set_options(
                 [
                     "打开「世界观文档」导入一份设定",
                     "打开 API 设置，配置 DeepSeek Key",
@@ -951,7 +983,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self._config.has_api_key:
-            self.action_panel.set_options(
+            self._set_options(
                 [
                     "当前世界观已就绪，去配置 API Key",
                     "查看当前世界观文档",
@@ -969,7 +1001,7 @@ class MainWindow(QMainWindow):
                 "查看当前世界观文档",
             ]
 
-        self.action_panel.set_options(options)
+        self._set_options(options)
 
     def _on_usage(self) -> None:
         dialog = UsageDialog(self._usage, self._config.usd_to_cny, self)
@@ -1051,6 +1083,11 @@ class MainWindow(QMainWindow):
         ok = self._backdrop.set_background(path, styles.COLORS["bg_window"])
         if not ok:
             LOG.warn("界面", f"背景图加载失败，已忽略：{path}")
+
+    def _set_options(self, options: list[str]) -> None:
+        """设置行动选项，并记住它们 —— 换肤重建面板时要还原。"""
+        self._current_options = list(options)
+        self.action_panel.set_options(options)
 
     def _refresh_status(self) -> None:
         """刷新状态栏的「世界观 / API」两段状态。"""
