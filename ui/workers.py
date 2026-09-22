@@ -12,7 +12,10 @@ import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.api_client import ApiError, ChatResult, DeepSeekClient, TestResult
+from core.items import ItemRequest, generate_items
+from core.models import Item, WorldState
 from core.prompts import JSON_REQUIREMENT, retry_note
+from core.savegame import HistoryLog, PlayerState
 from core.validator import (
     DEFAULT_MAX_RETRIES,
     GenerationAttempt,
@@ -288,3 +291,83 @@ class ValidateThread(QThread):
             "未提及的部分。直接输出内容本身，不要复述设定，不要加解释。\n\n"
             + JSON_REQUIREMENT.replace("你必须只输出一个 json 对象，", "若任务要求 json 输出，")
         )
+
+
+class ItemGenThread(QThread):
+    """AI 道具生成线程（阶段 7）。
+
+    一次生成会触发两类 API 调用：生成本身、以及紧随其后的世界观校验。
+    两者的用量都通过 usage_ready 上报给主线程记账。
+    """
+
+    progress = pyqtSignal(str)
+    #: 一轮尝试结束，携带 GenerationAttempt
+    attempt_done = pyqtSignal(object)
+    #: 完成，携带 ItemGenerationResult
+    done = pyqtSignal(object)
+    #: 失败，携带 ValidationExhausted 或 ApiError
+    failed = pyqtSignal(object)
+    #: (model, usage_dict, reason)
+    usage_ready = pyqtSignal(str, object, str)
+
+    def __init__(
+        self,
+        client: DeepSeekClient,
+        world: WorldDocument | None,
+        request: ItemRequest,
+        *,
+        player: PlayerState | None = None,
+        state: WorldState | None = None,
+        inventory: list[Item] | None = None,
+        history: HistoryLog | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._client = client
+        self._world = world
+        self._request = request
+        self._player = player
+        self._state = state
+        self._inventory = inventory
+        self._history = history
+        self._max_retries = max_retries
+
+        self._stop = threading.Event()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            result = generate_items(
+                self._client,
+                self._world,
+                self._request,
+                player=self._player,
+                state=self._state,
+                inventory=self._inventory,
+                history=self._history,
+                max_retries=self._max_retries,
+                on_progress=self.progress.emit,
+                on_attempt=self.attempt_done.emit,
+                on_usage=lambda model, usage, reason: self.usage_ready.emit(
+                    model, usage, reason
+                ),
+                should_stop=lambda: self._stop.is_set(),
+            )
+        except ValidationExhausted as exc:
+            self.failed.emit(exc)
+        except ApiError as exc:
+            self.failed.emit(exc)
+        except BaseException as exc:  # noqa: BLE001
+            self.failed.emit(
+                ApiError(
+                    f"生成道具时出现未预期的错误：{type(exc).__name__}: {exc}",
+                    kind="unknown",
+                    detail=repr(exc),
+                )
+            )
+            return
+
+        self.done.emit(result)

@@ -1,7 +1,7 @@
-"""背包面板：道具列表 + 详情 + 使用 / 丢弃。
+"""背包面板：道具列表 + 详情 + 使用 / 丢弃 / 生成。
 
-阶段 1 用假数据把交互跑通，阶段 7 接入 AI 动态道具生成后
-直接调用 set_items() / upsert_item() 即可。
+道具全部由 AI 动态生成，框架不含任何预设道具表。
+面板本身不碰网络，生成请求通过 generate_requested 抛给主窗口处理。
 """
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -30,6 +30,8 @@ class InventoryPanel(Panel):
     use_requested = pyqtSignal(str)
     #: 请求丢弃道具，携带 item.id
     drop_requested = pyqtSignal(str)
+    #: 请求生成新道具（阶段 7）
+    generate_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__("背包", parent)
@@ -80,12 +82,22 @@ class InventoryPanel(Panel):
 
         self.body.addLayout(actions)
 
-        # 标题栏右侧显示持有数量
+        # 标题栏右侧：持有数量 + 生成入口
         self.count_label = QLabel("0 件")
         self.count_label.setStyleSheet(
             f"color: {styles.COLORS['text_faint']}; font-size: 12px;"
         )
         self.header_slot.addWidget(self.count_label)
+
+        self.generate_button = QPushButton("生成")
+        self.generate_button.setToolTip(
+            "让 AI 依据世界观与当前局势现场生成道具"
+        )
+        self.generate_button.setStyleSheet(
+            "padding: 2px 12px; font-size: 12.5px;"
+        )
+        self.generate_button.clicked.connect(self.generate_requested.emit)
+        self.add_header_widget(self.generate_button)
 
         self._apply_document_style()
         self.set_items([])

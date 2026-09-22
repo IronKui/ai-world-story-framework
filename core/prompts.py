@@ -117,18 +117,21 @@ def context_block(
     return "\n\n".join(block for block in blocks if block.strip())
 
 
-def retry_note(conflict_reasons: list[str]) -> str:
-    """重试时把上一次的冲突原因回喂给模型。
+def retry_note(problems: list[str]) -> str:
+    """重试时把上一次的问题回喂给模型。
 
     不带这个的话重试等于重新抽卡，很可能又踩同一个坑；
-    带上具体的冲突点，模型才有机会定向修正。
+    带上具体问题，模型才有机会定向修正。
+
+    problems 既可能是世界观冲突点（阶段 6），
+    也可能是输出格式错误（阶段 7 起的结构化生成）。
     """
-    if not conflict_reasons:
+    if not problems:
         return ""
 
-    bullets = "\n".join(f"  {i}. {reason}" for i, reason in enumerate(conflict_reasons, 1))
+    bullets = "\n".join(f"  {i}. {problem}" for i, problem in enumerate(problems, 1))
     return (
-        "\n\n【重要：上一次生成未通过世界观校验】\n"
-        f"冲突点：\n{bullets}\n"
+        "\n\n【重要：上一次生成未通过】\n"
+        f"问题：\n{bullets}\n"
         "请重新生成，务必避开上述问题，其余部分可以保持相似的思路。"
     )

@@ -74,8 +74,11 @@ class ValidationVerdict:
 
 
 class ValidationExhausted(Exception):
-    """连续多次校验失败，内容始终无法与世界观对齐。
+    """连续多次生成都没能产出可用内容。
 
+    失败可能是两种原因之一，也可能混在一起：
+      · 输出格式不合要求（JSON 解析不出来）—— 阶段 7 起的结构化生成
+      · 内容与世界观设定冲突
     message 可直接展示给玩家。
     """
 
@@ -85,19 +88,32 @@ class ValidationExhausted(Exception):
 
         reasons: list[str] = []
         for attempt in attempts:
-            for line in attempt.verdict.detail_lines():
+            if attempt.parse_error:
+                line = f"输出格式错误：{attempt.parse_error}"
                 if line not in reasons:
                     reasons.append(line)
+                continue
+            for detail in attempt.verdict.detail_lines():
+                if detail not in reasons:
+                    reasons.append(detail)
 
-        detail = "\n".join(f"· {r}" for r in reasons[:6]) if reasons else "（未返回具体原因）"
-
-        super().__init__(
-            f"连续 {max_retries} 次生成的内容都与世界观设定冲突，"
-            f"已放弃本次生成。\n\n"
-            f"冲突点：\n{detail}\n\n"
-            f"建议：换一种行动方式，或检查世界观文档中是否存在自相矛盾的设定。"
-        )
         self.reasons = reasons
+        detail = "\n".join(f"· {r}" for r in reasons[:6]) or "（未返回具体原因）"
+
+        # 两种失败模式的提示语不一样：格式问题通常与世界观无关
+        has_format_issue = any(a.parse_error for a in attempts)
+        has_conflict = any(
+            not a.parse_error and not a.verdict.passed for a in attempts
+        )
+
+        if has_format_issue and not has_conflict:
+            headline = f"连续 {max_retries} 次生成的内容格式都不合要求，已放弃本次生成。"
+            advice = "建议：换一种操作方式重试；若反复出现，可在调试日志中查看模型的原始输出。"
+        else:
+            headline = f"连续 {max_retries} 次生成的内容都与世界观设定冲突，已放弃本次生成。"
+            advice = "建议：换一种行动方式，或检查世界观文档中是否存在自相矛盾的设定。"
+
+        super().__init__(f"{headline}\n\n问题：\n{detail}\n\n{advice}")
 
 
 # ----------------------------------------------------------------------
@@ -107,11 +123,15 @@ class ValidationExhausted(Exception):
 
 @dataclass
 class GenerationAttempt:
-    """一次生成 + 校验的完整记录。"""
+    """一次生成 + 解析 + 校验的完整记录。"""
 
     index: int
     content: str
     verdict: ValidationVerdict
+    #: 解析回调的产物（阶段 7 起是结构化对象）。纯文本生成时为 None
+    parsed: object = None
+    #: 解析失败原因。非空表示这一轮根本没走到校验
+    parse_error: str = ""
     #: 这一轮生成本身消耗的 token 情况，供用量统计
     generate_usage: dict = field(default_factory=dict)
     validate_usage: dict = field(default_factory=dict)
@@ -119,7 +139,7 @@ class GenerationAttempt:
 
     @property
     def ok(self) -> bool:
-        return self.verdict.passed
+        return self.verdict.passed and not self.parse_error
 
 
 @dataclass
@@ -128,6 +148,8 @@ class GuardedResult:
 
     content: str
     attempts: list[GenerationAttempt]
+    #: 解析回调的产物，调用方真正要用的东西
+    parsed: object = None
 
     @property
     def retries_used(self) -> int:
@@ -321,57 +343,101 @@ def guarded_generate(
     world: WorldDocument | None,
     *,
     generate: Callable[[list[str]], str],
+    parse: Callable[[str], tuple[object, str]] | None = None,
+    render_for_validation: Callable[[object], str] | None = None,
     kind: str = "内容",
     max_retries: int = DEFAULT_MAX_RETRIES,
     on_progress: Callable[[str], None] | None = None,
     on_attempt: Callable[[GenerationAttempt], None] | None = None,
+    on_usage: Callable[[str, dict, str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> GuardedResult:
-    """生成 → 校验 → 冲突则重试，最多 max_retries 次。
+    """生成 → 解析 → 校验，任一环节不合格就带着原因重试，最多 max_retries 次。
 
-    generate 接收「上一轮的冲突原因列表」，用于把问题回喂给模型。
-    首次调用时列表为空。
+    generate 接收「上一轮的问题列表」（首次为空），把问题回喂给模型。
+
+    parse 是可选的解析回调，返回 (结果, 错误说明)。
+    错误说明非空表示这一轮没生成出可用结构 —— 直接重试，不再浪费一次
+    校验调用去检查一段本来就无法使用的文本。
+
+    render_for_validation 把解析结果转成给校验模型看的文本。结构化生成
+    时应该提供：让校验模型逐字段读带标签的文本，比让它一边解析 json
+    一边判断冲突要可靠得多。
 
     连续失败时抛 ValidationExhausted，调用方负责弹窗。
     """
     attempts: list[GenerationAttempt] = []
-    conflict_reasons: list[str] = []
+    feedback: list[str] = []
 
     def report(message: str) -> None:
         if on_progress is not None:
             on_progress(message)
 
+    def record(attempt: GenerationAttempt) -> None:
+        attempts.append(attempt)
+        if on_attempt is not None:
+            on_attempt(attempt)
+
     for index in range(1, max_retries + 1):
         if should_stop is not None and should_stop():
             break
 
-        report(
-            f"第 {index}/{max_retries} 次生成中…"
-            if index > 1
-            else "生成中…"
-        )
+        report(f"第 {index}/{max_retries} 次生成中…" if index > 1 else "生成中…")
 
-        content = generate(conflict_reasons)
+        content = generate(feedback)
+
         if not (content or "").strip():
-            # 生成空内容也算一次失败尝试，继续重试
-            verdict = ValidationVerdict(passed=False, reason="生成内容为空")
-            attempt = GenerationAttempt(index=index, content="", verdict=verdict)
-            attempts.append(attempt)
-            if on_attempt is not None:
-                on_attempt(attempt)
-            conflict_reasons = ["上一次生成的内容为空"]
+            record(
+                GenerationAttempt(
+                    index=index,
+                    content="",
+                    verdict=ValidationVerdict(passed=False, reason="生成内容为空"),
+                )
+            )
+            feedback = ["上一次生成的内容为空"]
             continue
 
-        report(f"第 {index}/{max_retries} 次校验中…" if index > 1 else "校验中…")
+        # ---- 结构解析 ----
+        parsed: object = None
+        if parse is not None:
+            parsed, parse_error = parse(content)
+            if parse_error:
+                record(
+                    GenerationAttempt(
+                        index=index,
+                        content=content,
+                        verdict=ValidationVerdict(
+                            passed=False, reason=f"输出格式不合要求：{parse_error}"
+                        ),
+                        parse_error=parse_error,
+                    )
+                )
+                feedback = [f"输出格式错误：{parse_error}"]
+                report(f"第 {index} 次输出格式有误，正在重试…")
+                continue
 
-        verdict, _ = validate_content(
-            client, world, content, kind=kind, should_stop=should_stop
+        # ---- 世界观校验 ----
+        # 结构化生成时改送「逐字段排好的可读文本」而不是原始 json
+        check_text = content
+        if render_for_validation is not None and parsed is not None:
+            rendered = render_for_validation(parsed)
+            if (rendered or "").strip():
+                check_text = rendered
+
+        report(f"第 {index}/{max_retries} 次校验中…" if index > 1 else "校验中…")
+        verdict, check_result = validate_content(
+            client, world, check_text, kind=kind, should_stop=should_stop
         )
 
-        attempt = GenerationAttempt(index=index, content=content, verdict=verdict)
-        attempts.append(attempt)
-        if on_attempt is not None:
-            on_attempt(attempt)
+        # 校验也是一次真实的 API 调用，同样计入用量
+        if on_usage is not None and check_result is not None and check_result.usage:
+            on_usage(check_result.model, check_result.usage, "世界观校验")
+
+        record(
+            GenerationAttempt(
+                index=index, content=content, verdict=verdict, parsed=parsed
+            )
+        )
 
         if verdict.passed:
             if index > 1:
@@ -379,17 +445,19 @@ def guarded_generate(
             if verdict.error:
                 report("校验未完成（已放行）")
                 LOG.info("校验", f"本次内容未经有效校验即放行：{verdict.error}")
-            return GuardedResult(content=content, attempts=attempts)
+            return GuardedResult(
+                content=content, attempts=attempts, parsed=parsed
+            )
 
-        conflict_reasons = verdict.detail_lines() or [verdict.reason or "与世界观冲突"]
+        feedback = verdict.detail_lines() or [verdict.reason or "与世界观冲突"]
         report(f"第 {index} 次未通过校验，正在调整…")
 
     # 全部尝试失败
     LOG.error(
         "校验",
-        f"{max_retries} 次生成均未通过世界观校验",
+        f"{max_retries} 次生成均未产出可用内容",
         "\n".join(
-            f"第{a.index}次：{'；'.join(a.verdict.detail_lines()) or a.verdict.reason}"
+            f"第{a.index}次：{a.parse_error or '；'.join(a.verdict.detail_lines()) or a.verdict.reason}"
             for a in attempts
         ),
     )

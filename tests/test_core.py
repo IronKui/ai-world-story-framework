@@ -635,6 +635,223 @@ def test_validator() -> None:
 
 
 # ----------------------------------------------------------------------
+# 阶段 7：道具生成
+# ----------------------------------------------------------------------
+
+
+class _FakeItemClient:
+    """假的 API 客户端，按调用类型分发预设回应。
+
+    道具生成和世界观校验**都**走 json_mode，所以不能靠这个区分，
+    要看 system 提示词的开头。
+    """
+
+    def __init__(self, generation: list, verdicts: list):
+        self._generation = list(generation)
+        self._verdicts = list(verdicts)
+        self.generation_prompts: list[str] = []
+        self.validate_prompts: list[str] = []
+
+    def stream_chat(self, messages, **kwargs):
+        from core.api_client import ChatResult, ApiError
+
+        system = messages[0]["content"]
+        if system.startswith("你是一个文字游戏的道具生成器"):
+            self.generation_prompts.append(messages[-1]["content"])
+            payload = self._generation.pop(0)
+            if isinstance(payload, BaseException):
+                raise payload
+            return ChatResult(content=payload, model="fake", usage={"prompt_tokens": 10})
+
+        self.validate_prompts.append(messages[-1]["content"])
+        payload = self._verdicts.pop(0)
+        if isinstance(payload, ApiError):
+            raise payload
+        return ChatResult(content=payload, model="fake", usage={"prompt_tokens": 5})
+
+
+def test_items() -> None:
+    from core.items import (
+        ALL_TRIGGERS,
+        TRIGGER_HINTS,
+        ItemRequest,
+        build_item_prompt,
+        generate_items,
+        parse_items,
+    )
+    from core.models import Item, WorldState
+    from core.savegame import PlayerState
+    from core.validator import ValidationExhausted
+    from core.world import WorldDocument
+
+    # ---------- 结构解析 ----------
+    items, error = parse_items(
+        '{"items":[{"name":"灰晶砂","category":"材料","rarity":"精良",'
+        '"description":"d","lore":"l","effect":"e"}]}'
+    )
+    check(
+        "阶段7 解析标准结构",
+        error == "" and len(items) == 1 and items[0].name == "灰晶砂"
+        and items[0].rarity == "精良" and items[0].category == "材料",
+    )
+
+    for label, raw in [
+        ("代码块包裹", '```json\n{"items":[{"name":"A"}]}\n```'),
+        ("前后有说明", '好的：{"items":[{"name":"B"}]} 以上'),
+        ("单个对象而非数组", '{"items":{"name":"C"}}'),
+    ]:
+        parsed, err = parse_items(raw)
+        check(f"阶段7 解析宽容 {label}", err == "" and len(parsed) == 1)
+
+    for label, raw in [
+        ("非 json", "我觉得应该给玩家一把剑"),
+        ("items 为空", '{"items":[]}'),
+        ("缺 items 字段", '{"data":[]}'),
+        ("条目缺 name", '{"items":[{"category":"材料"}]}'),
+        ("空字符串", ""),
+    ]:
+        parsed, err = parse_items(raw)
+        check(f"阶段7 解析拒绝 {label}", parsed == [] and err != "")
+
+    # 坏条目跳过，好条目保留
+    mixed, err = parse_items('{"items":["字符串",{"name":"D"}]}')
+    check("阶段7 混入坏条目时保留好的", err == "" and [i.name for i in mixed] == ["D"])
+
+    # ---------- 稀有度归一 ----------
+    from core.items import _normalize_rarity
+
+    for raw, expected in [
+        ("稀有", "稀有"),
+        ("稀有度：史诗", "史诗"),      # 「稀有度」三字本身含「稀有」，不能先命中它
+        ("稀有度: 传说", "传说"),
+        ("品质：精良", "精良"),
+        ("Legendary", "传说"),
+        ("EPIC", "史诗"),
+        ("uncommon", "精良"),
+        ("很普通", "普通"),
+        ("", "普通"),
+        ("乱七八糟", "普通"),
+    ]:
+        got = _normalize_rarity(raw)
+        check(f"阶段7 稀有度归一 {raw!r}", got == expected, f"得到 {got}")
+
+    # ---------- 字段截断 ----------
+    long_items, _ = parse_items(
+        '{"items":[{"name":"' + "长" * 100 + '","lore":"' + "背" * 900 + '"}]}'
+    )
+    check(
+        "阶段7 字段截断在限额内（含省略号）",
+        len(long_items[0].name) == 40 and len(long_items[0].lore) == 500,
+    )
+
+    # ---------- 提示词 ----------
+    for trigger in ALL_TRIGGERS:
+        check(f"阶段7 触发场景有说明 {trigger}", TRIGGER_HINTS.get(trigger, "") != "")
+
+    world = WorldDocument(name="灰烬纪元", text="灰晶遇水会失效。")
+    inventory = [Item(name="火证", rarity="普通", category="信物")]
+    prompt = build_item_prompt(
+        world,
+        ItemRequest(trigger="开箱", count=2, scene="码头帮仓库", rarity_hint="稀有"),
+        player=PlayerState(name="凌昭"),
+        state=WorldState(location="灰烬港·下城"),
+        inventory=inventory,
+    )
+    check("阶段7 提示词含世界观", "灰晶遇水会失效" in prompt)
+    check("阶段7 提示词含位置", "灰烬港·下城" in prompt)
+    check("阶段7 提示词含玩家属性", "凌昭" in prompt)
+    # 不带背包的话，AI 会反复生成玩家已经有的东西
+    check("阶段7 提示词含现有背包", "火证" in prompt)
+    check("阶段7 提示词禁止重复", "请勿生成与上述道具重复" in prompt)
+    check("阶段7 提示词含触发场景", "开箱" in prompt and "码头帮仓库" in prompt)
+
+    # ---------- 生成循环 ----------
+    def make_client(generations, verdicts):
+        return _FakeItemClient(generations, verdicts)
+
+    good_json = '{"items":[{"name":"铁匣","rarity":"精良","category":"容器"}]}'
+    ok_verdict = '{"conflict": false}'
+
+    client = make_client([good_json], [ok_verdict])
+    result = generate_items(
+        client, world, ItemRequest(trigger="开箱", count=1), max_retries=3
+    )
+    check(
+        "阶段7 一次生成成功",
+        len(result.items) == 1 and result.items[0].name == "铁匣"
+        and not result.had_conflicts,
+    )
+    check("阶段7 校验用的是可读文本", "名称：铁匣" in client.validate_prompts[0])
+
+    # 格式错误 → 重试，且不该浪费一次校验调用
+    client = make_client(["这不是 json", good_json], [ok_verdict])
+    result = generate_items(
+        client, world, ItemRequest(trigger="开箱", count=1), max_retries=3
+    )
+    check(
+        "阶段7 解析失败会重试",
+        len(result.items) == 1 and result.retries_used == 1
+        and result.attempts[0].parse_error != "",
+    )
+    check(
+        "阶段7 解析失败不消耗校验调用",
+        len(client.validate_prompts) == 1,
+    )
+    # 格式错误必须以「格式」的形式回喂，而不是说成世界观冲突
+    check(
+        "阶段7 格式错误回喂给下一轮",
+        "输出格式错误" in client.generation_prompts[1],
+    )
+
+    # 世界观冲突 → 重试
+    conflict_verdict = '{"conflict": true, "reason": "冲突", "conflicts": ["点A"]}'
+    client = make_client([good_json, good_json], [conflict_verdict, ok_verdict])
+    result = generate_items(
+        client, world, ItemRequest(trigger="开箱", count=1), max_retries=3
+    )
+    check("阶段7 冲突后重试成功", result.retries_used == 1 and len(result.items) == 1)
+    check("阶段7 冲突点回喂给下一轮", "点A" in client.generation_prompts[1])
+
+    # 连续失败
+    client = make_client([good_json] * 3, [conflict_verdict] * 3)
+    try:
+        generate_items(client, world, ItemRequest(trigger="开箱", count=1), max_retries=3)
+        check("阶段7 连续冲突抛异常", False)
+    except ValidationExhausted as exc:
+        check("阶段7 连续冲突抛异常", len(exc.attempts) == 3)
+
+    # 全是格式错误时，提示语要说「格式」而不是「世界观冲突」
+    client = make_client(["坏", "坏", "坏"], [])
+    try:
+        generate_items(client, world, ItemRequest(trigger="开箱", count=1), max_retries=3)
+        check("阶段7 连续格式错误抛异常", False)
+    except ValidationExhausted as exc:
+        check("阶段7 连续格式错误抛异常", len(exc.attempts) == 3)
+        check("阶段7 格式错误提示语准确", "格式" in str(exc) and "世界观设定冲突" not in str(exc))
+
+    # 生成多了要按请求数量截断
+    three = ('{"items":[{"name":"A"},{"name":"B"},{"name":"C"}]}')
+    client = make_client([three], [ok_verdict])
+    result = generate_items(
+        client, world, ItemRequest(trigger="探索", count=2), max_retries=3
+    )
+    check("阶段7 超出数量被截断", len(result.items) == 2)
+
+    # 用量回调：生成与校验两次调用都要上报
+    reported: list[str] = []
+    client = make_client([good_json], [ok_verdict])
+    generate_items(
+        client, world, ItemRequest(trigger="探索", count=1), max_retries=3,
+        on_usage=lambda model, usage, reason: reported.append(reason),
+    )
+    check(
+        "阶段7 生成与校验分别上报用量",
+        sorted(reported) == ["世界观校验", "道具生成"],
+        str(reported),
+    )
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -663,6 +880,7 @@ def main() -> int:
         test_pricing()
         test_usage(tmp)
         test_validator()
+        test_items()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

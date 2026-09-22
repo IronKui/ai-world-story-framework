@@ -31,6 +31,7 @@ from core.world import DEFAULT_CONTEXT_BUDGET, WorldDocument, WorldStore
 from ui import styles
 from ui.action_panel import ActionPanel
 from ui.inventory_panel import InventoryPanel
+from ui.item_gen_dialog import ItemGenDialog
 from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
@@ -149,6 +150,11 @@ class MainWindow(QMainWindow):
         self.act_validate.triggered.connect(self._on_validate)
         tools_menu.addAction(self.act_validate)
 
+        self.act_gen_items = QAction("生成道具…", self)
+        self.act_gen_items.setStatusTip("让 AI 依据世界观现场生成道具")
+        self.act_gen_items.triggered.connect(self._on_generate_items)
+        tools_menu.addAction(self.act_gen_items)
+
         # ---------- 帮助 ----------
         help_menu = bar.addMenu("帮助")
 
@@ -257,6 +263,7 @@ class MainWindow(QMainWindow):
 
         self.inventory_panel.use_requested.connect(self._on_item_use)
         self.inventory_panel.drop_requested.connect(self._on_item_drop)
+        self.inventory_panel.generate_requested.connect(self._on_generate_items)
 
     # ---- 玩家操作：阶段 1 只做回显，阶段 9 接入主循环 ----
 
@@ -293,8 +300,82 @@ class MainWindow(QMainWindow):
         item = next((i for i in self.inventory_panel.items() if i.id == item_id), None)
         if item is None:
             return
-        self.story_panel.append_system(f"使用道具：{item.name}")
-        self._todo("道具效果结算", "阶段 7 实现（道具生成）")
+
+        if item.quantity > 1:
+            answer = QMessageBox.question(
+                self,
+                "使用道具",
+                f"使用「{item.name}」？\n"
+                f"当前持有 {item.quantity} 件，使用后剩余 {item.quantity - 1} 件。\n\n"
+                f"效果：{item.effect or '（未标注）'}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            item.quantity -= 1
+            self.inventory_panel.upsert_item(item)
+        else:
+            answer = QMessageBox.question(
+                self,
+                "使用道具",
+                f"使用「{item.name}」？\n"
+                f"这是最后一件，使用后将从背包中消失。\n\n"
+                f"效果：{item.effect or '（未标注）'}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.inventory_panel.remove_item(item_id)
+
+        self.story_panel.append_player_action(f"使用「{item.name}」")
+        if item.effect:
+            self.story_panel.append_narrative(item.effect)
+
+        # 使用道具同样计入历史，后续 AI 生成时能看到
+        self._history.record(f"使用了道具「{item.name}」")
+
+    def _on_generate_items(self) -> None:
+        if self._world is None:
+            QMessageBox.information(
+                self,
+                "尚未导入世界观",
+                "道具必须依据世界观生成，请先在「游戏 → 世界观文档」中导入一份。",
+            )
+            return
+
+        if not self._config.has_api_key:
+            QMessageBox.warning(
+                self,
+                "尚未配置 API Key",
+                "生成道具需要调用 DeepSeek 接口，请先在「设置 → API 设置」中填入 Key。",
+            )
+            return
+
+        dialog = ItemGenDialog(
+            self._config,
+            self._world,
+            player=self._player,
+            state=self._world_state,
+            inventory=self.inventory_panel.items(),
+            history=self._history,
+            tracker=self._usage,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_usage_label()
+
+        items = dialog.accepted_items
+        if not items:
+            return
+
+        for item in items:
+            self.inventory_panel.upsert_item(item)
+
+        names = "、".join(f"「{item.name}」" for item in items)
+        self.story_panel.append_system(f"获得道具：{names}")
+        self._history.record(f"获得了道具：{names}")
 
     def _on_item_drop(self, item_id: str) -> None:
         item = next((i for i in self.inventory_panel.items() if i.id == item_id), None)
