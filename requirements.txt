@@ -1,0 +1,4 @@
+PyQt6>=6.6
+
+# 阶段 5 接入 DeepSeek API 时启用（OpenAI 兼容协议）
+# requests>=2.31

@@ -1,0 +1,30 @@
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------- 运行时数据（全部本地，不入库）----------
+# 含 DeepSeek API Key，绝对不能提交
+data/config.json
+data/config.*.json
+
+# 存档 / 世界观副本 / 调试日志
+data/saves/
+data/worlds/
+data/logs/
+*.log
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# ---------- 临时文件 ----------
+_shot.png
+_smoke.py
