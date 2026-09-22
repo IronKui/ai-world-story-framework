@@ -19,11 +19,13 @@ from PyQt6.QtWidgets import (
 
 from core.config import AppConfig, ConfigStore
 from core.models import Item, WorldState
+from core.world import DEFAULT_CONTEXT_BUDGET, WorldDocument, WorldStore
 from ui import styles
 from ui.action_panel import ActionPanel
 from ui.inventory_panel import InventoryPanel
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
+from ui.world_doc_dialog import WorldDocDialog
 from ui.world_panel import WorldPanel
 
 
@@ -38,6 +40,9 @@ class MainWindow(QMainWindow):
         # 配置要在建菜单栏之前读：调试日志勾选项的初始状态依赖它
         self._config_store = ConfigStore()
         self._config: AppConfig = self._config_store.load()
+        self._world_store = WorldStore()
+        #: 当前生效的世界观文档，导入或读档后填充
+        self._world: WorldDocument | None = None
 
         self._build_menubar()
         self._build_body()
@@ -58,9 +63,12 @@ class MainWindow(QMainWindow):
         # ---------- 游戏 ----------
         game_menu = bar.addMenu("游戏")
 
-        self.act_import_world = self._make_action(
-            game_menu, "导入世界观文档…", "Ctrl+O", "阶段 3 实现"
-        )
+        self.act_world = QAction("世界观文档…", self)
+        self.act_world.setShortcut(QKeySequence("Ctrl+O"))
+        self.act_world.setStatusTip("导入、预览或切换世界观文档")
+        self.act_world.triggered.connect(self._on_world_docs)
+        game_menu.addAction(self.act_world)
+
         game_menu.addSeparator()
 
         self.act_start = self._make_action(
@@ -208,13 +216,22 @@ class MainWindow(QMainWindow):
     def _on_option_chosen(self, text: str) -> None:
         self.story_panel.append_player_action(text)
 
-        # 阶段 2 临时路由：让演示选项能直接打开设置窗口。
+        # 阶段 3 临时路由：让引导选项直接跳到对应入口。
         # 阶段 9 主循环接管后，这里统一改成把选项发给 AI 结算。
-        if text.startswith("打开 API 设置"):
-            self._on_api_settings()
+        handler = self._route_option(text)
+        if handler is not None:
+            handler()
             return
 
         self._todo("行动结算", "阶段 9 实现（主循环）")
+
+    def _route_option(self, text: str):
+        """把引导性质的选项映射到对应槽函数，普通行动返回 None。"""
+        if "世界观" in text:
+            return self._on_world_docs
+        if "API" in text:
+            return self._on_api_settings
+        return None
 
     def _on_free_input(self, text: str) -> None:
         self.story_panel.append_player_action(text)
@@ -286,8 +303,99 @@ class MainWindow(QMainWindow):
                 "调试日志已开启（日志记录功能将在阶段 10 写入文件）"
             )
 
+    # ---- 世界观 ----
+
+    def _on_world_docs(self) -> None:
+        dialog = WorldDocDialog(self._world, self)
+        dialog.exec()
+
+        if dialog.current_deleted:
+            self._set_world(None)
+            self.story_panel.append_system("当前世界观已被删除，请重新导入或选择")
+            return
+
+        chosen = dialog.chosen_world()
+        if chosen is not None and (
+            self._world is None or chosen.checksum != self._world.checksum
+        ):
+            self._set_world(chosen)
+
+    def _set_world(self, document: WorldDocument | None) -> None:
+        """切换当前世界观，并同步状态栏与剧情区提示。"""
+        self._world = document
+        self._refresh_status()
+
+        if document is None:
+            self.story_panel.append_system("当前没有生效的世界观文档")
+            self._refresh_options()
+            return
+
+        context_text, compressed = document.context_text()
+        self.story_panel.append_system(f"已加载世界观：《{document.name}》")
+
+        note = ""
+        if compressed:
+            note = (
+                f"\n文档共 {document.char_count} 字，超出上下文预算，"
+                f"送入 AI 时按章节结构压缩为 {len(context_text)} 字（标题全部保留）。"
+            )
+
+        self.story_panel.append_narrative(
+            f"世界规则已载入：《{document.name}》。\n"
+            f"接下来的场景、道具、事件与 NPC 都由 AI 依据这份设定实时生成，"
+            f"框架本身不含任何预设内容。{note}"
+        )
+        self._refresh_options()
+
+    def _refresh_options(self) -> None:
+        """按当前就绪状态给出一批引导选项。"""
+        if self._world is None:
+            self.action_panel.set_options(
+                [
+                    "打开「世界观文档」导入一份设定",
+                    "打开 API 设置，配置 DeepSeek Key",
+                ]
+            )
+            return
+
+        if not self._config.has_api_key:
+            self.action_panel.set_options(
+                [
+                    "当前世界观已就绪，去配置 API Key",
+                    "查看当前世界观文档",
+                ]
+            )
+            return
+
+        self.action_panel.set_options(
+            [
+                "环顾四周，看看这里有什么",
+                "查看当前世界观文档",
+                "开始正式游玩（阶段 9）",
+            ]
+        )
+
     def _refresh_status(self) -> None:
         """刷新状态栏的「世界观 / API」两段状态。"""
+        if self._world is None:
+            self.status_world.setText("世界观：未导入")
+            self.status_world.setStyleSheet(
+                f"color:{styles.COLORS['warning']}; font-size:12px;"
+            )
+            self.status_world.setToolTip("点击菜单「游戏 → 世界观文档」导入 .txt / .md")
+        else:
+            self.status_world.setText(f"世界观：{self._world.name}")
+            self.status_world.setStyleSheet(
+                f"color:{styles.COLORS['success']}; font-size:12px;"
+            )
+            context_text, compressed = self._world.context_text()
+            self.status_world.setToolTip(
+                f"原文 {self._world.char_count} 字\n"
+                f"送入 AI {len(context_text)} 字"
+                f"{'（已压缩）' if compressed else '（完整）'}\n"
+                f"预算 {DEFAULT_CONTEXT_BUDGET} 字"
+            )
+
         if self._config.has_api_key:
             self.status_api.setText(f"API：已配置（{self._config.masked_key()}）")
             self.status_api.setStyleSheet(
@@ -350,13 +458,7 @@ class MainWindow(QMainWindow):
                 "尚未配置 DeepSeek API Key。请打开「设置 → API 设置」填入后再继续。",
             )
 
-        self.action_panel.set_options(
-            [
-                "打开 API 设置，配置 DeepSeek Key",
-                "导入世界观文档（阶段 3）",
-                "查看当前界面框架",
-            ]
-        )
+        self._refresh_options()
 
         self.world_panel.update_world(
             WorldState(
