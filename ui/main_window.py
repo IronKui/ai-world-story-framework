@@ -19,10 +19,18 @@ from PyQt6.QtWidgets import (
 
 from core.config import AppConfig, ConfigStore
 from core.models import Item, WorldState
+from core.savegame import (
+    GameSave,
+    HistoryLog,
+    PlayerState,
+    SaveFormatError,
+    SaveStore,
+)
 from core.world import DEFAULT_CONTEXT_BUDGET, WorldDocument, WorldStore
 from ui import styles
 from ui.action_panel import ActionPanel
 from ui.inventory_panel import InventoryPanel
+from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
 from ui.world_doc_dialog import WorldDocDialog
@@ -41,8 +49,14 @@ class MainWindow(QMainWindow):
         self._config_store = ConfigStore()
         self._config: AppConfig = self._config_store.load()
         self._world_store = WorldStore()
+        self._save_store = SaveStore()
         #: 当前生效的世界观文档，导入或读档后填充
         self._world: WorldDocument | None = None
+        #: 玩家信息与历史摘要，构成存档的核心内容
+        self._player = PlayerState()
+        self._history = HistoryLog()
+        self._world_state = WorldState()
+        self._turns = 0
 
         self._build_menubar()
         self._build_body()
@@ -71,15 +85,22 @@ class MainWindow(QMainWindow):
 
         game_menu.addSeparator()
 
-        self.act_start = self._make_action(
-            game_menu, "开始新游戏", "Ctrl+N", "阶段 4 实现"
-        )
-        self.act_load = self._make_action(
-            game_menu, "读取存档…", "Ctrl+L", "阶段 4 实现"
-        )
-        self.act_save = self._make_action(
-            game_menu, "保存存档…", "Ctrl+S", "阶段 4 实现"
-        )
+        self.act_start = QAction("开始新游戏", self)
+        self.act_start.setShortcut(QKeySequence("Ctrl+N"))
+        self.act_start.setStatusTip("清空当前进度，从头开始")
+        self.act_start.triggered.connect(self._on_new_game)
+        game_menu.addAction(self.act_start)
+
+        self.act_load = QAction("读取存档…", self)
+        self.act_load.setShortcut(QKeySequence("Ctrl+L"))
+        self.act_load.triggered.connect(self._on_load_game)
+        game_menu.addAction(self.act_load)
+
+        self.act_save = QAction("保存存档…", self)
+        self.act_save.setShortcut(QKeySequence("Ctrl+S"))
+        self.act_save.triggered.connect(self._on_save_game)
+        game_menu.addAction(self.act_save)
+
         game_menu.addSeparator()
 
         self.act_quit = QAction("退出", self)
@@ -231,6 +252,8 @@ class MainWindow(QMainWindow):
             return self._on_world_docs
         if "API" in text:
             return self._on_api_settings
+        if "保存" in text and "进度" in text:
+            return self._on_save_game
         return None
 
     def _on_free_input(self, text: str) -> None:
@@ -347,6 +370,128 @@ class MainWindow(QMainWindow):
         )
         self._refresh_options()
 
+    # ---- 存档 / 读档 ----
+
+    def _snapshot(self) -> GameSave:
+        """把当前界面状态收集成一份存档快照。
+
+        刻意不含 API Key —— Key 属于程序配置，不属于游戏进度。
+        slot 由 SaveDialog 写入前决定。
+        """
+        return GameSave(
+            turns=self._turns,
+            player=self._player,
+            inventory=self.inventory_panel.items(),
+            world_state=self._world_state,
+            world=self._world,
+            history=self._history,
+        )
+
+    def _has_progress(self) -> bool:
+        return self._turns > 0 or not self._history.is_empty()
+
+    def _on_save_game(self) -> None:
+        dialog = SaveDialog(
+            self._save_store, MODE_SAVE, snapshot=self._snapshot(), parent=self
+        )
+        if dialog.exec() != SaveDialog.DialogCode.Accepted:
+            return
+
+        slot = dialog.selected_slot()
+        self.story_panel.append_system(f"进度已保存到存档 {slot}")
+        self.status_mode.setText(f"已保存到存档 {slot}")
+
+    def _on_load_game(self) -> None:
+        dialog = SaveDialog(self._save_store, MODE_LOAD, parent=self)
+        dialog.exec()
+
+        save = dialog.loaded_save
+        if save is None:
+            return
+
+        if self._has_progress():
+            answer = QMessageBox.question(
+                self,
+                "读取存档",
+                "读取存档会覆盖当前进度，尚未保存的变化将丢失。\n\n确定继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self._apply_save(save)
+
+    def _apply_save(self, save: GameSave) -> None:
+        """把存档恢复到界面与内存状态。"""
+        self._turns = save.turns
+        self._player = save.player
+        self._history = save.history
+        self._world_state = save.world_state
+        self._world = save.world
+
+        # 存档里带着世界观副本。如果本地仓库没有这份（比如换过机器），
+        # 补写回去 —— 文件名带内容校验和，重复写入是幂等的。
+        if save.world is not None:
+            try:
+                self._world_store.save(save.world)
+            except OSError:
+                pass  # 补写失败不影响本次游玩
+
+        self.world_panel.update_player(save.player)
+        self.world_panel.update_world(save.world_state)
+        self.inventory_panel.set_items(save.inventory)
+
+        self.story_panel.clear()
+        self.story_panel.append_system(
+            f"已读取存档 {save.slot}（保存于 {save.saved_at}，回合 {save.turns}）"
+        )
+
+        world_note = (
+            f"世界观《{save.world.name}》" if save.world else "存档未绑定世界观"
+        )
+        self.story_panel.append_narrative(
+            f"进度已恢复。{world_note}，"
+            f"当前位于{save.world_state.location or '未知地点'}，"
+            f"背包 {len(save.inventory)} 件道具。"
+        )
+
+        if save.history.summary:
+            self.story_panel.append_dialog(
+                "回忆", save.history.summary[:400]
+            )
+
+        self._refresh_status()
+        self._refresh_options()
+        self.status_mode.setText(f"已读取存档 {save.slot}")
+
+    def _on_new_game(self) -> None:
+        if self._has_progress():
+            answer = QMessageBox.question(
+                self,
+                "开始新游戏",
+                "当前进度将被清空，未保存的变化将丢失。\n\n确定开始新游戏吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self._reset_progress()
+        self.story_panel.append_system("已重置进度，开始新的旅程")
+        self.status_mode.setText("新游戏")
+
+    def _reset_progress(self) -> None:
+        self._turns = 0
+        self._player = PlayerState()
+        self._history = HistoryLog()
+        self._world_state = WorldState()
+        self.inventory_panel.set_items([])
+        self.world_panel.update_player(self._player)
+        self.world_panel.update_world(self._world_state)
+        self._refresh_status()
+        self._refresh_options()
+
     def _refresh_options(self) -> None:
         """按当前就绪状态给出一批引导选项。"""
         if self._world is None:
@@ -367,13 +512,17 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.action_panel.set_options(
-            [
-                "环顾四周，看看这里有什么",
-                "查看当前世界观文档",
-                "开始正式游玩（阶段 9）",
-            ]
-        )
+        options = [
+            "环顾四周，看看这里有什么",
+            "查看当前世界观文档",
+        ]
+        # 已经有进度时，把存档入口也摆在显眼位置
+        if self._has_progress():
+            options.append("保存当前进度")
+        else:
+            options.append("开始正式游玩（阶段 9）")
+
+        self.action_panel.set_options(options)
 
     def _refresh_status(self) -> None:
         """刷新状态栏的「世界观 / API」两段状态。"""
@@ -460,36 +609,14 @@ class MainWindow(QMainWindow):
 
         self._refresh_options()
 
-        self.world_panel.update_world(
-            WorldState(
-                location="未导入世界观",
-                time="—",
-                factions=[],
-                flags=[],
-            )
+        self._world_state = WorldState(
+            location="未导入世界观", time="—", factions=[], flags=[]
         )
+        self.world_panel.update_world(self._world_state)
 
-        self.inventory_panel.set_items(
-            [
-                Item(
-                    name="示例道具·锈蚀的钥匙",
-                    rarity="普通",
-                    category="杂物",
-                    description="一把锈得几乎认不出齿形的铜钥匙。",
-                    lore="用于验证背包面板的排版效果，阶段 7 起全部由 AI 生成。",
-                    effect="无实际效果（演示用）",
-                    source="阶段 1 演示数据",
-                ),
-                Item(
-                    name="示例道具·残页手札",
-                    rarity="稀有",
-                    category="文献",
-                    description="半张被水浸过的羊皮纸，字迹尚有三分之一可辨。",
-                    lore="同样是演示数据，读档时不会被写入存档。",
-                    effect="无实际效果（演示用）",
-                    source="阶段 1 演示数据",
-                ),
-            ]
-        )
+        # 背包刻意留空：道具全部由 AI 动态生成，框架不含任何预设道具。
+        # （阶段 1 曾放过两件演示道具，存档功能上线后它们会被写进存档，
+        #   变成污染真实进度的假数据，已移除。）
+        self.inventory_panel.set_items([])
 
         self.story_panel.append_system("提示：点击左侧选项或直接输入文字，试试面板交互")

@@ -8,13 +8,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from core.paths import WORLDS_DIR, ensure_dirs
+from core.storage import read_json, write_json_atomic
 
 #: 可导入的扩展名
 SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown"}
@@ -316,10 +316,7 @@ class WorldStore:
         filename = f"{_slugify(document.name)}-{document.checksum[:8]}.json"
         path = self.directory / filename
 
-        payload = json.dumps(
-            document.to_dict(), ensure_ascii=False, indent=2
-        )
-        path.write_text(payload, encoding="utf-8")
+        write_json_atomic(path, document.to_dict())
         return path
 
     def list_all(self) -> list[WorldDocument]:
@@ -337,12 +334,9 @@ class WorldStore:
         return [doc for _, doc in documents]
 
     def _load_path(self, path: Path) -> WorldDocument | None:
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # 单个文件损坏不该让整个列表打不开
-            return None
-        if not isinstance(raw, dict):
+        # 单个文件损坏不该让整个列表打不开
+        raw = read_json(path)
+        if raw is None:
             return None
         try:
             return WorldDocument.from_dict(raw)

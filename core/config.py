@@ -7,13 +7,11 @@
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from core.paths import CONFIG_FILE, ensure_dirs
+from core.storage import read_json, write_json_atomic
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
@@ -87,42 +85,13 @@ class ConfigStore:
 
     def load(self) -> AppConfig:
         """读取配置。文件不存在或损坏时回退默认值，绝不抛异常打断启动。"""
-        if not self.exists():
-            return AppConfig()
-
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        raw = read_json(self.path)
+        if raw is None:
             # 配置损坏不该让程序起不来，退回默认配置即可
-            return AppConfig()
-
-        if not isinstance(raw, dict):
             return AppConfig()
         return AppConfig.from_dict(raw)
 
     def save(self, config: AppConfig) -> None:
         ensure_dirs()
-        payload = json.dumps(config.to_dict(), ensure_ascii=False, indent=2)
-
-        # 原子写：先写同目录临时文件再 replace，中途断电不会留下半个 JSON
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self.path.parent), prefix=".config-", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            self._restrict_permissions(tmp_path)
-            os.replace(tmp_path, self.path)
-        except BaseException:
-            Path(tmp_path).unlink(missing_ok=True)
-            raise
-
-    def _restrict_permissions(self, path: str | Path) -> None:
-        """POSIX 下把含 Key 的文件权限收到仅本人可读写。"""
-        if os.name == "posix":
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
+        # restrict=True：这个文件里是 API Key，权限要收紧
+        write_json_atomic(self.path, config.to_dict(), restrict=True)

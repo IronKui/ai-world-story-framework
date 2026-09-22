@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.models import WorldState, relation_color
+from core.savegame import PlayerState
 from ui import styles
 from ui.panel_base import Panel
 
@@ -24,6 +25,27 @@ class WorldPanel(Panel):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__("世界状态", parent)
+
+        c = styles.COLORS
+
+        # ---------- 玩家 ----------
+        player_header = QLabel("玩家")
+        player_header.setObjectName("PanelHint")
+        self.body.addWidget(player_header)
+
+        self.player_name_label = QLabel()
+        self.player_name_label.setStyleSheet(
+            f"color:{c['text']}; font-size:14.5px; font-weight:600;"
+        )
+        self.body.addWidget(self.player_name_label)
+
+        self.player_attr_label = QLabel()
+        self.player_attr_label.setWordWrap(True)
+        self.body.addWidget(self.player_attr_label)
+
+        self.player_status_label = QLabel()
+        self.player_status_label.setWordWrap(True)
+        self.body.addWidget(self.player_status_label)
 
         # ---------- 位置 / 时间 ----------
         form = QFormLayout()
@@ -62,6 +84,7 @@ class WorldPanel(Panel):
         )
         self.body.addWidget(self.flags_label)
 
+        self.update_player(PlayerState())
         self.update_world(WorldState())
 
     # ---------- 对外接口 ----------
@@ -72,6 +95,37 @@ class WorldPanel(Panel):
         self.time_value.setText(state.time or "未知")
         self._render_factions(state.factions)
         self._render_flags(state.flags)
+
+    def update_player(self, player: PlayerState) -> None:
+        """刷新玩家信息。属性表由 AI 动态维护，这里只负责渲染。"""
+        c = styles.COLORS
+        self.player_name_label.setText(player.name or "无名者")
+
+        if player.attributes:
+            chips = "　".join(
+                f'<span style="color:{c["text_dim"]};">{key}</span>'
+                f'<span style="color:{c["accent"]};"> {value}</span>'
+                for key, value in player.attributes.items()
+            )
+            self.player_attr_label.setText(chips)
+            self.player_attr_label.setTextFormat(Qt.TextFormat.RichText)
+        else:
+            self.player_attr_label.setText(
+                f'<span style="color:{c["text_faint"]};">属性尚未确定</span>'
+            )
+            self.player_attr_label.setTextFormat(Qt.TextFormat.RichText)
+
+        if player.status:
+            self.player_status_label.setText(
+                f'<span style="color:{c["warning"]};">'
+                + "　".join(f"◈ {s}" for s in player.status)
+                + "</span>"
+            )
+        else:
+            self.player_status_label.setText(
+                f'<span style="color:{c["text_faint"]};">无异常状态</span>'
+            )
+        self.player_status_label.setTextFormat(Qt.TextFormat.RichText)
 
     def set_location(self, location: str) -> None:
         self.location_value.setText(location or "未知")
