@@ -13,6 +13,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.api_client import ApiError, ChatResult, DeepSeekClient, TestResult
 from core.events import generate_event
+from core.game import run_turn
 from core.items import ItemRequest, generate_items
 from core.models import Item, WorldState
 from core.prompts import JSON_REQUIREMENT, retry_note
@@ -365,6 +366,85 @@ class ItemGenThread(QThread):
             self.failed.emit(
                 ApiError(
                     f"生成道具时出现未预期的错误：{type(exc).__name__}: {exc}",
+                    kind="unknown",
+                    detail=repr(exc),
+                )
+            )
+            return
+
+        self.done.emit(result)
+
+
+class TurnThread(QThread):
+    """一个完整回合（阶段 9 主循环）。
+
+    串起事件生成、状态落定、道具生成、历史折叠。
+    所有环节都在子线程里跑，进度通过 progress 推给界面。
+    """
+
+    progress = pyqtSignal(str)
+    #: 携带 TurnResult
+    done = pyqtSignal(object)
+    #: 携带 ValidationExhausted / ApiError
+    failed = pyqtSignal(object)
+    #: (model, usage_dict, reason) —— 一个回合可能来好几条
+    usage_ready = pyqtSignal(str, object, str)
+
+    def __init__(
+        self,
+        client: DeepSeekClient,
+        world: WorldDocument | None,
+        action: str,
+        *,
+        player: PlayerState,
+        state: WorldState,
+        history: HistoryLog,
+        inventory: list | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        is_opening: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._client = client
+        self._world = world
+        self._action = action
+        self._player = player
+        self._state = state
+        self._history = history
+        self._inventory = inventory
+        self._max_retries = max_retries
+        self._is_opening = is_opening
+
+        self._stop = threading.Event()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            result = run_turn(
+                self._client,
+                self._world,
+                self._action,
+                player=self._player,
+                state=self._state,
+                history=self._history,
+                inventory=self._inventory,
+                max_retries=self._max_retries,
+                is_opening=self._is_opening,
+                on_progress=self.progress.emit,
+                on_usage=lambda model, usage, reason: self.usage_ready.emit(
+                    model, usage, reason
+                ),
+                should_stop=lambda: self._stop.is_set(),
+            )
+        except (ValidationExhausted, ApiError) as exc:
+            self.failed.emit(exc)
+            return
+        except BaseException as exc:  # noqa: BLE001
+            self.failed.emit(
+                ApiError(
+                    f"回合结算时出现未预期的错误：{type(exc).__name__}: {exc}",
                     kind="unknown",
                     detail=repr(exc),
                 )

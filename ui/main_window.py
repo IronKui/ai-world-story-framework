@@ -1,7 +1,8 @@
-"""主窗口：菜单栏 + 各面板拼装 + 状态栏。
+"""主窗口：菜单栏 + 各面板拼装 + 状态栏 + 游戏主循环。
 
-阶段 1 只有界面和交互骨架，菜单项统一走 _todo() 占位，
-后续阶段逐个把槽函数替换成真实实现。
+点击选项与自由文本输入最终都汇入 _begin_turn()，
+该回合在后台线程里跑完「生成事件 → 落状态 → 生成道具 → 折叠历史」，
+再回到主线程刷新界面。
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.api_client import DeepSeekClient
 from core.config import AppConfig, ConfigStore
+from core.game import OPENING_ACTION
 from core.debuglog import LOG
 from core.models import WorldState
 from core.savegame import (
@@ -27,18 +30,19 @@ from core.savegame import (
     SaveStore,
 )
 from core.usage import UsageTracker
+from core.validator import ValidationExhausted
 from core.world import DEFAULT_CONTEXT_BUDGET, WorldDocument, WorldStore
 from ui import styles
 from ui.action_panel import ActionPanel
-from ui.inventory_panel import InventoryPanel
-from ui.item_gen_dialog import ItemGenDialog
 from ui.event_dialog import EventDialog
+from ui.inventory_panel import InventoryPanel
 from ui.item_gen_dialog import ItemGenDialog
 from ui.save_dialog import MODE_LOAD, MODE_SAVE, SaveDialog
 from ui.settings_dialog import ApiSettingsDialog
 from ui.story_panel import StoryPanel
 from ui.usage_dialog import UsageDialog
 from ui.validate_dialog import ValidateDialog
+from ui.workers import TurnThread
 from ui.world_doc_dialog import WorldDocDialog
 from ui.world_panel import WorldPanel
 
@@ -67,6 +71,8 @@ class MainWindow(QMainWindow):
         self._history = HistoryLog()
         self._world_state = WorldState()
         self._turns = 0
+        #: 当前正在跑的回合线程，同一时间只允许一个
+        self._thread: TurnThread | None = None
 
         self._build_menubar()
         self._build_body()
@@ -274,19 +280,28 @@ class MainWindow(QMainWindow):
         self.inventory_panel.drop_requested.connect(self._on_item_drop)
         self.inventory_panel.generate_requested.connect(self._on_generate_items)
 
-    # ---- 玩家操作：阶段 1 只做回显，阶段 9 接入主循环 ----
+    # ---- 玩家操作：两种交互方式汇入同一条主循环 ----
 
     def _on_option_chosen(self, text: str) -> None:
-        self.story_panel.append_player_action(text)
-
-        # 阶段 3 临时路由：让引导选项直接跳到对应入口。
-        # 阶段 9 主循环接管后，这里统一改成把选项发给 AI 结算。
+        """点击选项。"""
+        # 未开局时的引导选项先走路由，不消耗 AI 调用
         handler = self._route_option(text)
         if handler is not None:
+            self.story_panel.append_player_action(text)
             handler()
             return
 
-        self._todo("行动结算", "阶段 9 实现（主循环）")
+        self._begin_turn(text)
+
+    def _on_free_input(self, text: str) -> None:
+        """自由输入文本。与点击选项走完全相同的流程。"""
+        self._begin_turn(text)
+
+    def _on_refresh_requested(self) -> None:
+        """换一批选项：以「重新观察」为动作再结算一回合。"""
+        if self._thread is not None and self._thread.isRunning():
+            return
+        self._begin_turn("我停下来，重新观察周围的情况。")
 
     def _route_option(self, text: str):
         """把引导性质的选项映射到对应槽函数，普通行动返回 None。"""
@@ -296,14 +311,193 @@ class MainWindow(QMainWindow):
             return self._on_api_settings
         if "保存" in text and "进度" in text:
             return self._on_save_game
+        if "开始新的旅程" in text or "生成开场" in text:
+            return self._on_new_game
         return None
 
-    def _on_free_input(self, text: str) -> None:
-        self.story_panel.append_player_action(text)
-        self._todo("自由行动结算", "阶段 9 实现（主循环）")
+    # ---- 主循环 ----
 
-    def _on_refresh_requested(self) -> None:
-        self._todo("重新生成行动选项", "阶段 8 实现（事件生成）")
+    def _game_ready(self) -> bool:
+        """开局条件检查。不满足时给出明确指引，而不是静默失败。"""
+        if self._world is None:
+            QMessageBox.information(
+                self,
+                "尚未导入世界观",
+                "这个框架不含任何预设剧情，一切都由 AI 依据世界观生成。\n\n"
+                "请先在「游戏 → 世界观文档」中导入一份 .txt 或 .md 设定。",
+            )
+            return False
+
+        if not self._config.has_api_key:
+            QMessageBox.warning(
+                self,
+                "尚未配置 API Key",
+                "游玩需要调用 DeepSeek 接口。\n\n"
+                "请先在「设置 → API 设置」中填入 API Key 并测试连通性。",
+            )
+            return False
+
+        return True
+
+    def _make_client(self) -> DeepSeekClient:
+        return DeepSeekClient(
+            api_key=self._config.api_key,
+            base_url=self._config.normalized_base_url(),
+            model=self._config.model,
+            timeout=self._config.timeout,
+        )
+
+    def _begin_turn(self, action: str, *, is_opening: bool = False) -> None:
+        """开始一个回合。点击选项与自由输入最终都汇到这里。"""
+        if self._thread is not None and self._thread.isRunning():
+            return
+        if not self._game_ready():
+            return
+
+        if not is_opening:
+            self.story_panel.append_player_action(action)
+
+        self.action_panel.set_busy(True, "AI 正在生成内容，请稍候…")
+        self.inventory_panel.set_actions_enabled(False)
+        self.status_mode.setText("结算中…")
+
+        self._thread = TurnThread(
+            self._make_client(),
+            self._world,
+            action,
+            player=self._player,
+            state=self._world_state,
+            history=self._history,
+            inventory=self.inventory_panel.items(),
+            max_retries=self._config.max_validate_retries,
+            is_opening=is_opening,
+            parent=self,
+        )
+        self._thread.progress.connect(self._on_turn_progress)
+        self._thread.done.connect(self._on_turn_done)
+        self._thread.failed.connect(self._on_turn_failed)
+        self._thread.usage_ready.connect(self._on_usage_ready)
+        self._thread.finished.connect(self._on_turn_finished)
+        self._thread.start()
+
+    def _begin_opening(self) -> None:
+        """开场。复用主循环，动作由 framework 合成。"""
+        if self._thread is not None and self._thread.isRunning():
+            return
+        if not self._game_ready():
+            return
+
+        self.action_panel.set_busy(True, "正在展开世界…")
+        self.inventory_panel.set_actions_enabled(False)
+        self.status_mode.setText("开场…")
+
+        self._thread = TurnThread(
+            self._make_client(),
+            self._world,
+            OPENING_ACTION,
+            player=self._player,
+            state=self._world_state,
+            history=self._history,
+            inventory=[],
+            max_retries=self._config.max_validate_retries,
+            is_opening=True,
+            parent=self,
+        )
+        self._thread.progress.connect(self._on_turn_progress)
+        self._thread.done.connect(self._on_turn_done)
+        self._thread.failed.connect(self._on_turn_failed)
+        self._thread.usage_ready.connect(self._on_usage_ready)
+        self._thread.finished.connect(self._on_turn_finished)
+        self._thread.start()
+
+    def _on_turn_progress(self, message: str) -> None:
+        self.status_mode.setText(message)
+
+    def _on_usage_ready(self, model: str, usage: dict, reason: str) -> None:
+        """在主线程记账 —— 一个回合可能来好几条（事件 / 校验 / 道具 / 摘要）。"""
+        self._usage.record(
+            model=model,
+            usage=usage,
+            reason=reason,
+            peak=self._config.forced_peak(),
+        )
+
+    def _on_turn_finished(self) -> None:
+        self._thread = None
+
+    def _on_turn_done(self, result) -> None:
+        self._turns += 1
+        self._render_turn(result)
+
+        self._refresh_usage_label()
+        self._refresh_status()
+        self.action_panel.set_busy(False)
+        self.inventory_panel.set_actions_enabled(True)
+        self.status_mode.setText(f"第 {self._turns} 回合")
+
+        # 换上新一批行动选项
+        self.action_panel.set_options(result.event.options)
+        self.action_panel.focus_input()
+
+    def _on_turn_failed(self, error) -> None:
+        self.action_panel.set_busy(False)
+        self.inventory_panel.set_actions_enabled(True)
+        self.status_mode.setText("已中断")
+
+        if isinstance(error, ValidationExhausted):
+            # 需求指定：连续 3 次校验失败弹窗提示玩家重新操作
+            self.story_panel.append_system("本次生成未通过世界观校验，已放弃")
+            message = f"当前 AI 无法生成符合世界观的内容，请重新进行操作。\n\n{error}"
+        else:
+            self.story_panel.append_system("本次操作未能完成")
+            message = getattr(error, "message", str(error))
+
+        QMessageBox.warning(self, "生成失败", message)
+
+        # 把可用选项还给玩家，别让人卡在空面板上
+        self._refresh_options()
+
+    # ---- 回合渲染 ----
+
+    def _render_turn(self, result) -> None:
+        """把一个回合的结果铺到界面上。
+
+        顺序与玩家阅读顺序一致：正文 → NPC → 状态变化 → 道具 → 毁灭推进。
+        """
+        event = result.event
+
+        self.story_panel.append_narrative(event.narrative)
+
+        if event.has_npc():
+            self.story_panel.append_dialog(event.npc, event.npc_dialog or "……")
+
+        self.world_panel.update_world(self._world_state)
+        self.world_panel.update_player(self._player)
+
+        # 状态变更用系统行提示，避免和叙事正文混在一起
+        if result.change_notes:
+            self.story_panel.append_system("　".join(result.change_notes))
+
+        for item in result.items_gained:
+            self.inventory_panel.upsert_item(item)
+        if result.items_gained:
+            names = "、".join(
+                f"「{item.name}」（{item.rarity}）" for item in result.items_gained
+            )
+            self.story_panel.append_system(f"获得道具：{names}")
+
+        # 毁灭进度推进是大事，必须让玩家看见
+        if result.applied_doom_delta > 0:
+            self.story_panel.append_system(
+                f"毁灭进度推进 {result.applied_doom_delta} 级 → "
+                f"{self._world_state.doom.progress_text()}"
+            )
+
+        # 重试与折叠只在调试日志里留痕，界面上不打扰玩家
+        if result.retries_used:
+            LOG.info("回合", f"本回合经过 {result.retries_used} 次重试后通过")
+        if result.history_folded:
+            LOG.info("回合", "本回合触发了一次历史摘要折叠")
 
     def _on_item_use(self, item_id: str) -> None:
         item = next((i for i in self.inventory_panel.items() if i.id == item_id), None)
@@ -636,9 +830,17 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        if not self._game_ready():
+            return
+
         self._reset_progress()
-        self.story_panel.append_system("已重置进度，开始新的旅程")
-        self.status_mode.setText("新游戏")
+        self.story_panel.clear()
+        self.story_panel.append_system(
+            f"新的旅程开始　·　世界观《{self._world.name}》"
+        )
+
+        # 开场也走主循环，只是动作是合成的
+        self._begin_opening()
 
     def _reset_progress(self) -> None:
         self._turns = 0
@@ -671,15 +873,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        options = [
-            "环顾四周，看看这里有什么",
-            "查看当前世界观文档",
-        ]
-        # 已经有进度时，把存档入口也摆在显眼位置
-        if self._has_progress():
-            options.append("保存当前进度")
+        if self._turns > 0:
+            # 已经在游玩中：选项由每回合的 AI 生成结果接管，
+            # 这里只在回合失败时兜底
+            options = ["重新观察周围的情况", "查看当前世界观文档"]
         else:
-            options.append("开始正式游玩（阶段 9）")
+            options = [
+                "开始新的旅程（生成开场）",
+                "查看当前世界观文档",
+            ]
 
         self.action_panel.set_options(options)
 
@@ -786,24 +988,28 @@ class MainWindow(QMainWindow):
             "技术栈：Python + PyQt6<br>"
             "模型：DeepSeek（需自备 API Key）<br>"
             "存储：本地 JSON，不上传云端<br><br>"
-            "<span style='color:#8b94a8'>当前进度：阶段 1 / 10 —— 窗体 UI 框架</span>",
+            "<span style='color:#8b94a8'>界面框架 + 本地存储 + AI 动态生成</span>",
         )
 
     def _load_demo_content(self) -> None:
-        """演示内容，阶段 9 会被真实的 AI 开场替换。"""
+        """启动画面。
+
+        这里刻意不放任何示例剧情或示例道具 ——
+        框架不含预设内容，世界必须由玩家的世界观文档 + AI 生成。
+        """
         story = self.story_panel
-        story.append_system("界面框架与本地配置已就绪")
+        story.append_system("框架已就绪")
         story.append_narrative(
-            "程序已启动。你现在看到的是一套空的世界容器——没有预设地图、"
-            "没有写死的道具表、也没有写死的事件脚本。\n\n"
-            "导入一份世界观文档之后，世界才会真正开始运转。"
+            "这是一套空的世界容器：没有预设地图、没有写死的道具表、"
+            "也没有写死的事件脚本。\n\n"
+            "导入一份世界观文档并配置 API Key 之后，"
+            "世界才会由 AI 依据你的设定开始运转。"
         )
 
         if self._config.has_api_key:
             story.append_dialog(
                 "系统",
-                f"已读取本地配置，API Key（{self._config.masked_key()}）就绪。"
-                "可在「设置 → API 设置」中测试连通性。",
+                f"已读取本地配置，API Key（{self._config.masked_key()}）就绪。",
             )
         else:
             story.append_dialog(
@@ -811,16 +1017,12 @@ class MainWindow(QMainWindow):
                 "尚未配置 DeepSeek API Key。请打开「设置 → API 设置」填入后再继续。",
             )
 
-        self._refresh_options()
-
         self._world_state = WorldState(
             location="未导入世界观", time="—", factions=[], flags=[]
         )
         self.world_panel.update_world(self._world_state)
 
         # 背包刻意留空：道具全部由 AI 动态生成，框架不含任何预设道具。
-        # （阶段 1 曾放过两件演示道具，存档功能上线后它们会被写进存档，
-        #   变成污染真实进度的假数据，已移除。）
         self.inventory_panel.set_items([])
 
-        self.story_panel.append_system("提示：点击左侧选项或直接输入文字，试试面板交互")
+        self._refresh_options()

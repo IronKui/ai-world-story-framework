@@ -63,6 +63,10 @@ EVENT_SYSTEM = f"""你是一个文字游戏的实时事件生成器。玩家的�
 4. 选项要彼此差异化，代表不同的立场或风险，不要是同一件事的三种说法。
    其中可以包含一两个明显危险或激进的选项。
 5. 状态变更只写真正发生了变化的项，没变的一律留空。
+6. 【重要】玩家的状态列表是**累加**的，不会自动清理。所以一旦新状态
+   取代了旧状态，必须把旧状态原样写进 player_status_remove，否则列表里
+   会同时留着互相矛盾的条目（例如「干渴」和「喝足了水」并存），
+   进而污染后续所有生成。宁可多删也不要留下已被取代的旧状态。
 
 {JSON_REQUIREMENT}
 
@@ -74,13 +78,18 @@ EVENT_SYSTEM = f"""你是一个文字游戏的实时事件生成器。玩家的�
   "options": ["行动选项1", "行动选项2", "行动选项3"],
   "doom_delta": 0,
   "doom_reason": "若 doom_delta 大于 0，说明玩家的什么选择推动了毁灭进度；否则空字符串",
+  "item_gain": {{
+    "trigger": "仅当玩家本回合确实获得了东西时填写：探索 / 开箱 / 战斗奖励 / 交易 / 赠予；否则空字符串",
+    "count": 1,
+    "hint": "物件所在的具体位置或来源，例如「铁匣夹层」「死者腰间」"
+  }},
   "state_changes": {{
     "location": "位置变化后的名称；未变化则空字符串",
     "time": "时间推进后的描述；未变化则空字符串",
     "faction_changes": [{{"name": "势力名", "relation": "盟友/友好/中立/疏远/敌对/死敌"}}],
     "add_flags": ["本回合新产生的世界印记"],
-    "player_status_add": ["玩家新获得的伤势或状态"],
-    "player_status_remove": ["已经消退的状态"],
+    "player_status_add": ["玩家新获得或发生变化的状态"],
+    "player_status_remove": ["被新状态取代、因而不该再保留的旧状态（必须填，见要求 6）"],
     "player_notes": "一句话概括玩家当前处境；没变化则空字符串"
   }}
 }}"""
@@ -177,6 +186,23 @@ class StateChanges:
 
 
 @dataclass
+class ItemGain:
+    """本回合玩家获得了道具的指示。
+
+    AI 只负责说「这里该有东西」并给出场景类型，
+    真正的道具由阶段 7 的生成器依据世界观现场造出来。
+    这样事件与道具不会各说各话。
+    """
+
+    trigger: str = ""
+    count: int = 1
+    hint: str = ""
+
+    def is_empty(self) -> bool:
+        return not self.trigger.strip()
+
+
+@dataclass
 class GameEvent:
     """一个实时生成的事件。"""
 
@@ -188,6 +214,8 @@ class GameEvent:
     doom_delta: int = 0
     doom_reason: str = ""
     changes: StateChanges = field(default_factory=StateChanges)
+    #: 本回合的获得道具指示，空表示没有
+    item_gain: ItemGain = field(default_factory=ItemGain)
 
     def has_npc(self) -> bool:
         return bool(self.npc.strip())
@@ -246,8 +274,34 @@ def parse_event(raw: str) -> tuple[GameEvent | None, str]:
             doom_delta=_parse_int(payload.get("doom_delta")),
             doom_reason=_clip(payload.get("doom_reason"), LIMITS["flag"]),
             changes=_parse_changes(payload.get("state_changes")),
+            item_gain=_parse_item_gain(payload.get("item_gain")),
         ),
         "",
+    )
+
+
+def _parse_item_gain(value) -> ItemGain:
+    """解析获得道具的指示。
+
+    触发器不在白名单里就当作没有 —— 否则会把未知类型丢给道具生成器，
+    生成出的东西和事件场景对不上。
+    """
+    from core.items import MAX_ITEMS_PER_CALL, TRIGGER_HINTS
+
+    if not isinstance(value, dict):
+        return ItemGain()
+
+    trigger = str(value.get("trigger") or "").strip()
+    if trigger not in TRIGGER_HINTS:
+        return ItemGain()
+
+    count = _parse_int(value.get("count")) or 1
+    count = max(1, min(count, MAX_ITEMS_PER_CALL))
+
+    return ItemGain(
+        trigger=trigger,
+        count=count,
+        hint=_clip(value.get("hint"), LIMITS["flag"]),
     )
 
 
@@ -385,6 +439,12 @@ def describe_event_for_validation(event: GameEvent) -> str:
         lines.append(
             f"（本次生成试图推进毁灭进度 {event.doom_delta} 级，"
             f"理由：{event.doom_reason or '未给出'}）"
+        )
+
+    if not event.item_gain.is_empty():
+        lines.append(
+            f"（本回合玩家获得道具：{event.item_gain.trigger}"
+            f"，来源：{event.item_gain.hint or '未说明'}）"
         )
 
     changes = event.changes
