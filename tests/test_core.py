@@ -1819,6 +1819,173 @@ def test_jsonstream() -> None:
 
 
 # ----------------------------------------------------------------------
+# 主窗口回合流程
+# ----------------------------------------------------------------------
+
+
+def test_mainwindow_signal_handlers() -> None:
+    """MainWindow 里 connect 的每个槽函数都必须真的存在。
+
+    这条是有血的教训的：v0.1.0 发布版里给 _begin_turn 接流式信号时，
+    `connect(self._on_turn_delta)` 加进去了，但方法定义漏了。
+    结果玩家点「开始新的旅程」→ set_busy(True) 先锁界面 →
+    connect 抛 AttributeError → 崩溃兜底弹窗 → 界面永久锁死。
+    线程压根没启动，所以也不会超时恢复。
+
+    这类「引用了不存在的东西」静态就能查出来，不必等到用户踩。
+    """
+    import re
+
+    from ui.main_window import MainWindow
+
+    source = (ROOT / "ui" / "main_window.py").read_text(encoding="utf-8")
+
+    # 找出所有 .connect(self.YYY) 里引用的方法名
+    referenced = set(re.findall(r"\.connect\(\s*self\.(\w+)\s*\)", source))
+    check("主窗口 存在被 connect 的槽函数", bool(referenced), str(referenced))
+
+    # 用 hasattr 而不是解析 def —— 有些槽是继承来的
+    # （例如 self.act_quit.triggered.connect(self.close) 里的 close）
+    missing = sorted(name for name in referenced if not hasattr(MainWindow, name))
+
+    check(
+        "主窗口 connect 的槽函数都已定义",
+        not missing,
+        "缺失: " + ", ".join(missing) if missing else "",
+    )
+
+
+def _install_qt_offscreen() -> bool:
+    """尽量在没有显示器的情况下也能建 Qt 应用。"""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    return True
+
+
+def test_mainwindow_turn_flow() -> None:
+    """跑完整一个回合，确认界面状态正确回到可交互。
+
+    用假客户端，不消耗 token，也不需要 API Key。
+    """
+    _install_qt_offscreen()
+
+    from PyQt6.QtWidgets import QApplication
+
+    from core.api_client import ChatResult
+    from ui.main_window import MainWindow
+    from ui.workers import TurnThread
+
+    app = QApplication.instance() or QApplication([])
+
+    class _FakeTurnClient:
+        """只回应事件的生成与校验，别的一律拒绝。"""
+
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.calls = 0
+
+        def stream_chat(self, messages, **kwargs):
+            from core.api_client import ApiError
+
+            self.calls += 1
+            if self.fail:
+                raise ApiError("模拟网络故障", kind="network")
+
+            system = messages[0]["content"]
+            if system.startswith("你是一个文字游戏的实时事件生成器"):
+                payload = (
+                    '{"narrative":"第一段。\\n\\n第二段。","npc":"","npc_dialog":"",'
+                    '"options":["选项甲","选项乙"],"doom_delta":0,"doom_reason":"",'
+                    '"state_changes":{}}'
+                )
+            elif system.startswith("你是一个世界观一致性校验器"):
+                payload = '{"conflict": false}'
+            else:
+                payload = "{}"
+
+            on_delta = kwargs.get("on_delta")
+            if on_delta is not None:
+                # 模拟真实分片：故意切在转义序列中间
+                for i in range(0, len(payload), 17):
+                    on_delta(payload[i : i + 17])
+            return ChatResult(content=payload, model="fake", usage={})
+
+    class _StubBox:
+        StandardButton = __import__(
+            "PyQt6.QtWidgets", fromlist=["QMessageBox"]
+        ).QMessageBox.StandardButton
+        shown: list = []
+
+        @staticmethod
+        def critical(*args, **kwargs):
+            _StubBox.shown.append(("critical", str(args[2]) if len(args) > 2 else ""))
+
+        warning = information = critical
+        question = staticmethod(lambda *a, **k: _StubBox.StandardButton.Yes)
+
+    import ui.main_window as mw
+
+    original_box = mw.QMessageBox
+    mw.QMessageBox = _StubBox
+
+    # 把工作目录指到临时目录，避免污染真实数据
+    import tempfile
+
+    from core import paths
+
+    original_data = paths.DATA_DIR
+
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            window = MainWindow()
+            window._todo = lambda *a, **k: None
+            window._set_world(
+                import_world_file(ROOT / "assets" / "示例世界观-眠神纪.md")
+            )
+
+            for label, should_fail in (("成功", False), ("失败", True)):
+                client = _FakeTurnClient(fail=should_fail)
+                window._make_client = lambda c=client: c
+                window._begin_opening()
+
+                thread: TurnThread | None = window._thread
+                check(f"回合 {label} 时线程已启动", thread is not None and thread.isRunning())
+                if thread is not None:
+                    thread.wait(20000)
+                app.processEvents()
+
+                # 核心断言：无论成功还是失败，界面必须回到可交互
+                check(
+                    f"回合 {label} 后输入框可用",
+                    window.action_panel.input_field.isEnabled(),
+                )
+                check(
+                    f"回合 {label} 后提交按钮可用",
+                    window.action_panel.send_button.isEnabled(),
+                )
+                check(
+                    f"回合 {label} 后流式区已收尾",
+                    window.story_panel._stream_start is None,
+                )
+
+            # 成功那轮应该换了新选项
+            check(
+                "回合成功后更新了行动选项",
+                len(window.action_panel._option_buttons) == 2,
+                str(len(window.action_panel._option_buttons)),
+            )
+
+            # 失败那轮应该弹了提示，而不是静默
+            check("回合失败有提示", len(_StubBox.shown) > 0, str(_StubBox.shown[:1]))
+
+            window.close()
+    finally:
+        mw.QMessageBox = original_box
+        del original_data
+
+
+# ----------------------------------------------------------------------
 # 模型
 # ----------------------------------------------------------------------
 
@@ -1860,6 +2027,8 @@ def main() -> int:
         test_worldgen()
         test_assets()
         test_jsonstream()
+        test_mainwindow_signal_handlers()
+        test_mainwindow_turn_flow()
         test_models()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -99,17 +99,29 @@ class StoryPanel(Panel):
         self._scroll_to_bottom()
 
     def end_stream(self) -> None:
-        """抹掉流式期间的临时文本，为正式排版让位。"""
+        """抹掉流式期间的临时文本，为正式排版让位。
+
+        这个方法被调用在界面解锁之前，所以**不能抛异常** ——
+        一旦抛出去，玩家就永久卡在「生成中」了。
+        因此这里对文档长度做了夹取：文档可能在流式期间被清空过
+        （例如玩家中途点了「开始新游戏」），记下的位置就失效了。
+        """
         if self._stream_start is None:
             return
 
-        cursor = self.view.textCursor()
-        cursor.setPosition(self._stream_start)
+        start = self._stream_start
+        # 先把状态清掉：即使下面出错，也不会留下一个永远清不掉的流式区
+        self._stream_start = None
+
+        document = self.view.document()
+        last = max(document.characterCount() - 1, 0)
+        cursor = QTextCursor(document)
+        cursor.setPosition(max(0, min(start, last)))
         cursor.movePosition(
             QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor
         )
         cursor.removeSelectedText()
-        self._stream_start = None
+        self._scroll_to_bottom()
 
     @property
     def is_streaming(self) -> bool:

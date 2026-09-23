@@ -381,8 +381,18 @@ class MainWindow(QMainWindow):
             timeout=self._config.timeout,
         )
 
+    def _begin_opening(self) -> None:
+        """开场。复用主循环，动作由 framework 合成。"""
+        self._begin_turn(OPENING_ACTION, is_opening=True)
+
     def _begin_turn(self, action: str, *, is_opening: bool = False) -> None:
-        """开始一个回合。点击选项与自由输入最终都汇到这里。"""
+        """开始一个回合。点击选项、自由输入、开场都汇到这里。
+
+        开场原本是一份几乎相同的复制代码，结果两边各自漂移 ——
+        修流式时只给其中一份接上了 delta 信号，另一份没有，
+        而漏掉的那个方法定义又没补上，直接导致发布版点「开始新的旅程」
+        界面永久锁死。现在合成一份，从根上避免这种漂移。
+        """
         if self._thread is not None and self._thread.isRunning():
             return
         if not self._game_ready():
@@ -391,13 +401,10 @@ class MainWindow(QMainWindow):
         if not is_opening:
             self.story_panel.append_player_action(action)
 
-        self.action_panel.set_busy(True, "AI 正在生成内容，请稍候…")
-        self.inventory_panel.set_actions_enabled(False)
-        self.status_mode.setText("结算中…")
-        # 开始流式：正文会逐字打到剧情区，结束后再换成正式排版
-        self.story_panel.begin_stream()
-
-        self._thread = TurnThread(
+        # ---- 先把线程建好、信号全部接上，**最后才锁界面** ----
+        # 顺序不能反：锁界面之后只要再抛一次异常，
+        # _restore_after_turn() 就永远跑不到，玩家会卡在「生成中」动不了。
+        thread = TurnThread(
             self._make_client(),
             self._world,
             action,
@@ -409,44 +416,30 @@ class MainWindow(QMainWindow):
             is_opening=is_opening,
             parent=self,
         )
-        self._thread.progress.connect(self._on_turn_progress)
-        self._thread.done.connect(self._on_turn_done)
-        self._thread.failed.connect(self._on_turn_failed)
-        self._thread.usage_ready.connect(self._on_usage_ready)
-        self._thread.finished.connect(self._on_turn_finished)
-        self._thread.start()
+        thread.progress.connect(self._on_turn_progress)
+        thread.delta.connect(self._on_turn_delta)
+        thread.done.connect(self._on_turn_done)
+        thread.failed.connect(self._on_turn_failed)
+        thread.usage_ready.connect(self._on_usage_ready)
+        thread.finished.connect(self._on_turn_finished)
 
-    def _begin_opening(self) -> None:
-        """开场。复用主循环，动作由 framework 合成。"""
-        if self._thread is not None and self._thread.isRunning():
-            return
-        if not self._game_ready():
-            return
-
-        self.action_panel.set_busy(True, "正在展开世界…")
+        # ---- 到这里为止都没动界面，出错也不会留下锁死状态 ----
+        self.action_panel.set_busy(True, "正在展开世界…" if is_opening else "AI 正在生成内容，请稍候…")
         self.inventory_panel.set_actions_enabled(False)
-        self.status_mode.setText("开场…")
+        self.status_mode.setText("开场…" if is_opening else "结算中…")
         self.story_panel.begin_stream()
 
-        self._thread = TurnThread(
-            self._make_client(),
-            self._world,
-            OPENING_ACTION,
-            player=self._player,
-            state=self._world_state,
-            history=self._history,
-            inventory=[],
-            max_retries=self._config.max_validate_retries,
-            is_opening=True,
-            parent=self,
-        )
-        self._thread.progress.connect(self._on_turn_progress)
-        self._thread.delta.connect(self._on_turn_delta)
-        self._thread.done.connect(self._on_turn_done)
-        self._thread.failed.connect(self._on_turn_failed)
-        self._thread.usage_ready.connect(self._on_usage_ready)
-        self._thread.finished.connect(self._on_turn_finished)
-        self._thread.start()
+        self._thread = thread
+        thread.start()
+
+    def _on_turn_delta(self, piece: str) -> None:
+        """正文流式片段，直接打到剧情区。
+
+        流式期间先按纯文本追加，生成结束后由 _on_turn_done 抹掉
+        再按正式排版重画（一句话一段、段间留白）。
+        边写边排版的话，分片切在段落中间会导致每个字都重排整段。
+        """
+        self.story_panel.stream_text(piece)
 
     def _on_turn_progress(self, message: str) -> None:
         self.status_mode.setText(message)
@@ -467,16 +460,19 @@ class MainWindow(QMainWindow):
         """回合结束。渲染本身出错也必须先把界面恢复可交互状态，
         否则玩家会卡在「生成中」动不了。"""
         self._turns += 1
-        # 抹掉流式期间的临时文本，换成正式排版
-        self.story_panel.end_stream()
+
+        # 先解锁 —— 后面无论哪一步抛异常，玩家都还能继续操作
+        self._restore_after_turn()
+
         try:
+            # 抹掉流式期间的临时文本，换成正式排版
+            self.story_panel.end_stream()
             self._render_turn(result)
         except Exception:  # noqa: BLE001
             LOG.exception(
                 "界面", "渲染回合结果时出错，本回合内容可能显示不完整", sys.exc_info()[1]
             )
-        finally:
-            self._restore_after_turn()
+            return
 
         # 换上新一批行动选项
         self._set_options(result.event.options)
@@ -491,10 +487,15 @@ class MainWindow(QMainWindow):
         self.status_mode.setText(f"第 {self._turns} 回合")
 
     def _on_turn_failed(self, error) -> None:
-        # 生成失败时流式区里可能留着半截文本，也要清掉
-        self.story_panel.end_stream()
+        # 先解锁再清理 —— end_stream 万一抛异常，界面也不会卡死
         self._restore_after_turn()
         self.status_mode.setText("已中断")
+
+        # 生成失败时流式区里可能留着半截文本，也要清掉
+        try:
+            self.story_panel.end_stream()
+        except Exception:  # noqa: BLE001
+            LOG.exception("界面", "清理流式区时出错", sys.exc_info()[1])
 
         if isinstance(error, ValidationExhausted):
             # 需求指定：连续 3 次校验失败弹窗提示玩家重新操作
