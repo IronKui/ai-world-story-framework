@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 import shutil
@@ -1823,8 +1824,8 @@ def test_jsonstream() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_mainwindow_signal_handlers() -> None:
-    """MainWindow 里 connect 的每个槽函数都必须真的存在。
+def test_signal_handlers_exist() -> None:
+    """所有界面类里 connect 的槽函数都必须真的存在。
 
     这条是有血的教训的：v0.1.0 发布版里给 _begin_turn 接流式信号时，
     `connect(self._on_turn_delta)` 加进去了，但方法定义漏了。
@@ -1833,25 +1834,59 @@ def test_mainwindow_signal_handlers() -> None:
     线程压根没启动，所以也不会超时恢复。
 
     这类「引用了不存在的东西」静态就能查出来，不必等到用户踩。
+    所以这里覆盖全部 ui/ 下的类，不只是主窗口。
     """
+    import importlib
     import re
 
-    from ui.main_window import MainWindow
+    checked = 0
+    missing: list[str] = []
+    per_file: dict[str, int] = {}
 
-    source = (ROOT / "ui" / "main_window.py").read_text(encoding="utf-8")
+    for path in sorted((ROOT / "ui").glob("*.py")):
+        if path.name.startswith("_"):
+            continue
 
-    # 找出所有 .connect(self.YYY) 里引用的方法名
-    referenced = set(re.findall(r"\.connect\(\s*self\.(\w+)\s*\)", source))
-    check("主窗口 存在被 connect 的槽函数", bool(referenced), str(referenced))
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        tree = ast.parse(source)
+        module = importlib.import_module(f"ui.{path.stem}")
 
-    # 用 hasattr 而不是解析 def —— 有些槽是继承来的
-    # （例如 self.act_quit.triggered.connect(self.close) 里的 close）
-    missing = sorted(name for name in referenced if not hasattr(MainWindow, name))
+        count = 0
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            # 只在这个类的行范围内找 —— 早期版本的检查脚本漏了这一步，
+            # 结果把整个文件的 connect 都算到第一个类头上，全是假报警
+            start = cls.lineno
+            end = max(
+                (getattr(n, "end_lineno", start) or start) for n in ast.walk(cls)
+            )
+            body = "\n".join(lines[start - 1 : end])
+
+            for match in re.finditer(r"\.connect\(\s*self\.(\w+)\s*\)", body):
+                name = match.group(1)
+                count += 1
+                obj = getattr(module, cls.name, None)
+                # 用 hasattr 而不是解析 def —— 有些槽是继承来的
+                # （例如 triggered.connect(self.close) 里的 QWidget.close）
+                if obj is None or not hasattr(obj, name):
+                    missing.append(f"{path.name} {cls.name}.{name}")
+
+        per_file[path.name] = count
+        checked += count
+
+    check("界面 connect 数量合理", checked > 50, f"只检查到 {checked} 处")
 
     check(
-        "主窗口 connect 的槽函数都已定义",
+        "界面 connect 的槽函数都已定义",
         not missing,
-        "缺失: " + ", ".join(missing) if missing else "",
+        "缺失: " + "; ".join(missing) if missing else "",
+    )
+
+    # 主窗口那几处是这次踩坑的地方，单独确认确实被扫到了
+    check(
+        "主窗口的流式槽被扫到",
+        per_file.get("main_window.py", 0) > 0,
+        str(per_file.get("main_window.py")),
     )
 
 
@@ -2027,7 +2062,7 @@ def main() -> int:
         test_worldgen()
         test_assets()
         test_jsonstream()
-        test_mainwindow_signal_handlers()
+        test_signal_handlers_exist()
         test_mainwindow_turn_flow()
         test_models()
     finally:
